@@ -9,6 +9,7 @@ services.transfer_order_service + constants.py respectively. This
 module orchestrates the admin lifecycle without re-deriving state.
 """
 
+import json
 import math
 import uuid
 from typing import List, Optional
@@ -19,26 +20,38 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 
+from datetime import datetime, timezone
+
 from constants import (
+    ACTION_TO_APPROVED,
     ACTION_TO_CANCELLED,
+    ACTION_TO_CLOSED,
     ACTION_TO_CREATED,
     ACTION_TO_DELETED,
     ACTION_TO_LINE_SHORT_CLOSED,
+    ACTION_TO_REJECTED,
+    ACTION_TO_SUBMITTED,
 )
 from middleware.auth_middleware import require_auth, require_role
 from middleware.db import with_db
 from routes.admin import admin_bp
 from schemas.csv_import import TransferOrderImportRow
 from services.audit_service import write_audit_log
+from services.events_service import emit_event
 from services.transfer_order_service import (
+    TO_APPROVAL_APPROVED,
+    TO_APPROVAL_PENDING,
+    TO_APPROVAL_REJECTED,
     TO_LINE_PENDING,
     TO_LINE_PARTIALLY_PICKED,
     TO_LINE_PICKED,
     TO_LINE_SHORT_CLOSED,
+    TO_STATUS_AWAITING_APPROVAL,
     TO_STATUS_CANCELLED,
     TO_STATUS_CLOSED,
     TO_STATUS_OPEN,
     TO_STATUS_PARTIALLY_PICKED,
+    evaluate_to_closure,
     generate_to_number,
     validate_header_transition,
     validate_line_transition,
@@ -960,4 +973,524 @@ def picker_get_transfer_order(to_id):
     return jsonify({
         "transfer_order": _serialise_to_header(header),
         "lines": [_serialise_to_line(r) for r in lines],
+    })
+
+
+# ============================================================
+# Picker submit (#293)
+# ============================================================
+
+
+@admin_bp.route("/picker/transfer-orders/<int:to_id>/submit", methods=["POST"])
+@require_auth
+@with_db
+def submit_transfer_order_picks(to_id):
+    """Picker batches their picks since the last submit into a
+    transfer_order_approvals row for admin review. Multiple submits
+    per TO are normal: each batch is approved or rejected
+    independently. Inventory does not move at submit time.
+    """
+    header = g.db.execute(
+        text(
+            "SELECT to_id, to_number, status, source_warehouse_id "
+            "  FROM transfer_orders WHERE to_id = :tid FOR UPDATE"
+        ),
+        {"tid": to_id},
+    ).fetchone()
+    if not header:
+        return jsonify({"error": "Transfer order not found"}), 404
+    if header.status not in (
+        TO_STATUS_PARTIALLY_PICKED, TO_STATUS_AWAITING_APPROVAL,
+    ):
+        return jsonify({
+            "error": "invalid_status_for_submit",
+            "current_status": header.status,
+        }), 409
+
+    # Lines with new picks since the last submit: picked_qty exceeds
+    # what has already been APPROVED on this line. Snapshots the
+    # delta so the approval row is independent of subsequent picks.
+    lines = g.db.execute(
+        text(
+            """
+            SELECT to_line_id, item_id, picked_qty, approved_qty,
+                   committed_qty, status
+              FROM transfer_order_lines
+             WHERE to_id = :tid AND picked_qty > approved_qty
+             ORDER BY line_number
+            """
+        ),
+        {"tid": to_id},
+    ).fetchall()
+    if not lines:
+        return jsonify({
+            "error": "nothing_picked",
+            "detail": (
+                "No new picks since the last submit. Pick more lines "
+                "before submitting."
+            ),
+        }), 422
+
+    snapshot_lines = [
+        {
+            "to_line_id": line.to_line_id,
+            "item_id": line.item_id,
+            "picked_in_snapshot": line.picked_qty - line.approved_qty,
+        }
+        for line in lines
+    ]
+    approval_row = g.db.execute(
+        text(
+            """
+            INSERT INTO transfer_order_approvals
+                (to_id, submitted_by, lines_snapshot, external_id)
+            VALUES (:tid, :sub, CAST(:snap AS JSONB), :ext)
+            RETURNING to_approval_id
+            """
+        ),
+        {
+            "tid": to_id,
+            "sub": g.current_user["username"],
+            "snap": json.dumps({"lines": snapshot_lines}),
+            "ext": str(uuid.uuid4()),
+        },
+    ).fetchone()
+    approval_id = approval_row.to_approval_id
+
+    # Header status: AWAITING_APPROVAL when every line is fully
+    # picked or short-closed; otherwise PARTIALLY_PICKED stays.
+    open_lines = g.db.execute(
+        text(
+            "SELECT COUNT(*) FROM transfer_order_lines "
+            " WHERE to_id = :tid "
+            "   AND status IN (:pending, :partial)"
+        ),
+        {
+            "tid": to_id,
+            "pending": TO_LINE_PENDING,
+            "partial": TO_LINE_PARTIALLY_PICKED,
+        },
+    ).scalar()
+    new_status = (
+        TO_STATUS_AWAITING_APPROVAL if open_lines == 0
+        else TO_STATUS_PARTIALLY_PICKED
+    )
+    if header.status != new_status:
+        g.db.execute(
+            text(
+                "UPDATE transfer_orders SET status = :st, updated_at = NOW() "
+                " WHERE to_id = :tid"
+            ),
+            {"st": new_status, "tid": to_id},
+        )
+
+    write_audit_log(
+        g.db,
+        action_type=ACTION_TO_SUBMITTED,
+        entity_type="TO",
+        entity_id=to_id,
+        user_id=g.current_user["username"],
+        warehouse_id=header.source_warehouse_id,
+        details={
+            "to_number": header.to_number,
+            "to_approval_id": approval_id,
+            "line_count": len(snapshot_lines),
+        },
+    )
+    g.db.commit()
+    return jsonify({
+        "to_approval_id": approval_id,
+        "status": "PENDING",
+        "to_status": new_status,
+        "line_count": len(snapshot_lines),
+    }), 201
+
+
+# ============================================================
+# Admin approve (#293)
+# ============================================================
+
+
+def _self_approval_blocked(db) -> bool:
+    row = db.execute(
+        text(
+            "SELECT value FROM app_settings "
+            " WHERE key = 'transfer_order_block_self_approval'"
+        ),
+    ).fetchone()
+    return bool(row and str(row.value).lower() == "true")
+
+
+def _decrement_source_inventory(
+    db, item_id: int, warehouse_id: int, qty: int,
+) -> None:
+    """Decrement quantity_allocated AND quantity_on_hand at source by
+    qty, distributing across bins in inventory_id ASC up to each row's
+    own quantity_allocated. Mirrors the import + cancel lock ordering
+    so concurrent operations stay deadlock-free."""
+    inv_rows = db.execute(
+        text(
+            """
+            SELECT inv.inventory_id, inv.quantity_on_hand,
+                   inv.quantity_allocated
+              FROM inventory inv
+             WHERE inv.item_id = :iid AND inv.warehouse_id = :wid
+               AND inv.quantity_allocated > 0
+             ORDER BY inv.inventory_id ASC
+             FOR UPDATE OF inv
+            """
+        ),
+        {"iid": item_id, "wid": warehouse_id},
+    ).fetchall()
+    remaining = qty
+    for ir in inv_rows:
+        if remaining <= 0:
+            break
+        give = min(remaining, ir.quantity_allocated, ir.quantity_on_hand)
+        if give == 0:
+            continue
+        db.execute(
+            text(
+                """
+                UPDATE inventory
+                   SET quantity_allocated = quantity_allocated - :delta,
+                       quantity_on_hand   = quantity_on_hand   - :delta,
+                       updated_at = NOW()
+                 WHERE inventory_id = :inv_id
+                """
+            ),
+            {"delta": give, "inv_id": ir.inventory_id},
+        )
+        remaining -= give
+    if remaining > 0:
+        # Source under-funded: import-time reservation must have been
+        # released by a concurrent cancel. Surface as 409 so the
+        # admin investigates rather than silently absorbing.
+        raise ValueError(
+            f"source inventory under-funded: still {remaining} units to "
+            f"deduct for item_id={item_id} at warehouse_id={warehouse_id}"
+        )
+
+
+def _credit_destination_inventory(
+    db, item_id: int, dest_warehouse_id: int, qty: int,
+) -> None:
+    """Add qty to the destination warehouse's inventory. Targets the
+    first Staging bin at the destination; INSERTs a new inventory
+    row if none exists for the (item, bin) pair. Raises ValueError
+    when the destination has no Staging bin (operator must add one).
+    """
+    bin_row = db.execute(
+        text(
+            """
+            SELECT bin_id FROM bins
+             WHERE warehouse_id = :wid
+               AND bin_type = 'Staging'
+             ORDER BY bin_id ASC LIMIT 1
+            """
+        ),
+        {"wid": dest_warehouse_id},
+    ).fetchone()
+    if not bin_row:
+        raise ValueError(
+            f"destination warehouse_id={dest_warehouse_id} has no "
+            f"Staging bin; add one before approving the transfer."
+        )
+    bin_id = bin_row.bin_id
+    existing = db.execute(
+        text(
+            """
+            SELECT inventory_id FROM inventory
+             WHERE item_id = :iid AND bin_id = :bid AND lot_number IS NULL
+             FOR UPDATE
+            """
+        ),
+        {"iid": item_id, "bid": bin_id},
+    ).fetchone()
+    if existing:
+        db.execute(
+            text(
+                "UPDATE inventory "
+                "   SET quantity_on_hand = quantity_on_hand + :qty, "
+                "       updated_at = NOW() "
+                " WHERE inventory_id = :inv_id"
+            ),
+            {"qty": qty, "inv_id": existing.inventory_id},
+        )
+    else:
+        db.execute(
+            text(
+                "INSERT INTO inventory "
+                "(item_id, bin_id, warehouse_id, quantity_on_hand) "
+                "VALUES (:iid, :bid, :wid, :qty)"
+            ),
+            {
+                "iid": item_id, "bid": bin_id,
+                "wid": dest_warehouse_id, "qty": qty,
+            },
+        )
+
+
+@admin_bp.route(
+    "/transfer-orders/<int:to_id>/approvals/<int:approval_id>/approve",
+    methods=["POST"],
+)
+@require_auth
+@require_role("ADMIN")
+@with_db
+def approve_transfer_order_approval(to_id, approval_id):
+    approval = g.db.execute(
+        text(
+            """
+            SELECT to_approval_id, to_id, submitted_by, status,
+                   approved_by, lines_snapshot, external_id
+              FROM transfer_order_approvals
+             WHERE to_approval_id = :aid AND to_id = :tid
+             FOR UPDATE
+            """
+        ),
+        {"aid": approval_id, "tid": to_id},
+    ).fetchone()
+    if not approval:
+        return jsonify({"error": "Approval row not found"}), 404
+    if approval.status != TO_APPROVAL_PENDING:
+        return jsonify({
+            "error": "approval_not_pending",
+            "current_status": approval.status,
+            "approved_by": approval.approved_by,
+        }), 409
+
+    if (_self_approval_blocked(g.db)
+            and approval.submitted_by == g.current_user["username"]):
+        return jsonify({
+            "error": "self_approval_blocked",
+            "submitted_by": approval.submitted_by,
+            "detail": (
+                "app_settings.transfer_order_block_self_approval is TRUE; "
+                "a different admin must approve this submission."
+            ),
+        }), 403
+
+    header = g.db.execute(
+        text(
+            "SELECT to_id, to_number, status, source_warehouse_id, "
+            "       destination_warehouse_id, external_id "
+            "  FROM transfer_orders WHERE to_id = :tid FOR UPDATE"
+        ),
+        {"tid": to_id},
+    ).fetchone()
+    if not header:
+        return jsonify({"error": "Transfer order not found"}), 404
+
+    snapshot_lines = (approval.lines_snapshot or {}).get("lines", []) or []
+    if not snapshot_lines:
+        return jsonify({
+            "error": "approval_snapshot_empty",
+            "detail": "Approval row has no line snapshot; nothing to approve.",
+        }), 422
+
+    # Process lines in item_id ASC for deterministic inventory locking.
+    snapshot_lines.sort(key=lambda r: r["item_id"])
+
+    event_lines = []
+    try:
+        for snap in snapshot_lines:
+            line_id = snap["to_line_id"]
+            item_id = snap["item_id"]
+            qty = int(snap["picked_in_snapshot"])
+            if qty <= 0:
+                continue
+            g.db.execute(
+                text(
+                    """
+                    UPDATE transfer_order_lines
+                       SET approved_qty = approved_qty + :qty,
+                           status = CASE
+                               WHEN approved_qty + :qty = picked_qty
+                                    AND picked_qty = committed_qty
+                                    THEN 'APPROVED'
+                               ELSE status
+                           END
+                     WHERE to_line_id = :lid
+                    """
+                ),
+                {"qty": qty, "lid": line_id},
+            )
+            _decrement_source_inventory(
+                g.db, item_id, header.source_warehouse_id, qty,
+            )
+            _credit_destination_inventory(
+                g.db, item_id, header.destination_warehouse_id, qty,
+            )
+            item_external = g.db.execute(
+                text("SELECT external_id FROM items WHERE item_id = :iid"),
+                {"iid": item_id},
+            ).fetchone()
+            event_lines.append({
+                "item_external_id": str(item_external.external_id),
+                "quantity": qty,
+            })
+    except ValueError as exc:
+        g.db.rollback()
+        return jsonify({"error": "approval_failed", "detail": str(exc)}), 409
+
+    approved_at = datetime.now(timezone.utc)
+    g.db.execute(
+        text(
+            """
+            UPDATE transfer_order_approvals
+               SET status = :st, approved_by = :by, approved_at = :at
+             WHERE to_approval_id = :aid
+            """
+        ),
+        {
+            "st": TO_APPROVAL_APPROVED,
+            "by": g.current_user["username"],
+            "at": approved_at,
+            "aid": approval_id,
+        },
+    )
+
+    write_audit_log(
+        g.db,
+        action_type=ACTION_TO_APPROVED,
+        entity_type="TO_APPROVAL",
+        entity_id=approval_id,
+        user_id=g.current_user["username"],
+        warehouse_id=header.source_warehouse_id,
+        details={
+            "to_id": to_id,
+            "to_number": header.to_number,
+            "line_count": len(event_lines),
+        },
+    )
+
+    closed = False
+    if evaluate_to_closure(g.db, to_id):
+        g.db.execute(
+            text(
+                "UPDATE transfer_orders "
+                "   SET status = :st, updated_at = NOW() "
+                " WHERE to_id = :tid"
+            ),
+            {"st": TO_STATUS_CLOSED, "tid": to_id},
+        )
+        write_audit_log(
+            g.db,
+            action_type=ACTION_TO_CLOSED,
+            entity_type="TO",
+            entity_id=to_id,
+            user_id=g.current_user["username"],
+            warehouse_id=header.source_warehouse_id,
+            details={"to_number": header.to_number},
+        )
+        closed = True
+
+    if event_lines:
+        emit_event(
+            g.db,
+            event_type="transfer.completed",
+            event_version=1,
+            aggregate_type="inventory_transfer",
+            aggregate_id=approval_id,
+            aggregate_external_id=approval.external_id,
+            warehouse_id=header.destination_warehouse_id,
+            source_txn_id=getattr(g, "source_txn_id", None) or str(uuid.uuid4()),
+            payload={
+                "transfer_external_id": str(approval.external_id),
+                "from_warehouse_id": header.source_warehouse_id,
+                "to_warehouse_id": header.destination_warehouse_id,
+                "lines": event_lines,
+                "completed_at": approved_at.isoformat().replace(
+                    "+00:00", "Z",
+                ),
+            },
+        )
+    g.db.commit()
+    return jsonify({
+        "to_approval_id": approval_id,
+        "status": "APPROVED",
+        "to_closed": closed,
+        "line_count": len(event_lines),
+    })
+
+
+# ============================================================
+# Admin reject (#293)
+# ============================================================
+
+
+@admin_bp.route(
+    "/transfer-orders/<int:to_id>/approvals/<int:approval_id>/reject",
+    methods=["POST"],
+)
+@require_auth
+@require_role("ADMIN")
+@with_db
+def reject_transfer_order_approval(to_id, approval_id):
+    body = request.get_json() or {}
+    rejection_reason = (body.get("rejection_reason") or "").strip()[:1000]
+    approval = g.db.execute(
+        text(
+            """
+            SELECT to_approval_id, to_id, submitted_by, status, external_id
+              FROM transfer_order_approvals
+             WHERE to_approval_id = :aid AND to_id = :tid
+             FOR UPDATE
+            """
+        ),
+        {"aid": approval_id, "tid": to_id},
+    ).fetchone()
+    if not approval:
+        return jsonify({"error": "Approval row not found"}), 404
+    if approval.status != TO_APPROVAL_PENDING:
+        return jsonify({
+            "error": "approval_not_pending",
+            "current_status": approval.status,
+        }), 409
+
+    rejected_at = datetime.now(timezone.utc)
+    g.db.execute(
+        text(
+            """
+            UPDATE transfer_order_approvals
+               SET status = :st, rejected_at = :at,
+                   rejection_reason = :reason
+             WHERE to_approval_id = :aid
+            """
+        ),
+        {
+            "st": TO_APPROVAL_REJECTED,
+            "at": rejected_at,
+            "reason": rejection_reason or None,
+            "aid": approval_id,
+        },
+    )
+
+    header = g.db.execute(
+        text(
+            "SELECT to_number, source_warehouse_id "
+            "  FROM transfer_orders WHERE to_id = :tid"
+        ),
+        {"tid": to_id},
+    ).fetchone()
+
+    write_audit_log(
+        g.db,
+        action_type=ACTION_TO_REJECTED,
+        entity_type="TO_APPROVAL",
+        entity_id=approval_id,
+        user_id=g.current_user["username"],
+        warehouse_id=header.source_warehouse_id if header else None,
+        details={
+            "to_id": to_id,
+            "to_number": header.to_number if header else None,
+            "submitted_by": approval.submitted_by,
+            "rejection_reason": rejection_reason or None,
+        },
+    )
+    g.db.commit()
+    return jsonify({
+        "to_approval_id": approval_id,
+        "status": "REJECTED",
     })

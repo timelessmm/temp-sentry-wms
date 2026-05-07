@@ -289,3 +289,38 @@ def maybe_promote_header_to_partially_picked(db, to_id: int) -> bool:
         },
     ).fetchone()
     return row is not None
+
+
+# ============================================================
+# Closure derivation against the live row state
+# ============================================================
+
+
+def evaluate_to_closure(db, to_id: int) -> bool:
+    """Return True when the TO meets every closure condition: every
+    line is APPROVED with approved_qty == picked_qty (or
+    SHORT_CLOSED) AND no PENDING approvals remain. Caller flips the
+    header to CLOSED and writes the audit row when this returns True."""
+    from sqlalchemy import text
+
+    line_states = db.execute(
+        text(
+            "SELECT status, approved_qty, picked_qty "
+            "  FROM transfer_order_lines WHERE to_id = :tid"
+        ),
+        {"tid": to_id},
+    ).fetchall()
+    if not line_states:
+        return False
+    if not is_header_closeable(
+        [(r.status, r.approved_qty, r.picked_qty) for r in line_states],
+    ):
+        return False
+    pending = db.execute(
+        text(
+            "SELECT COUNT(*) FROM transfer_order_approvals "
+            " WHERE to_id = :tid AND status = 'PENDING'"
+        ),
+        {"tid": to_id},
+    ).scalar()
+    return pending == 0

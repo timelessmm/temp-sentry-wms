@@ -392,19 +392,31 @@ def confirm_pick(db, pick_task_id, scanned_barcode, quantity_picked, username):
                 {"qty": quantity_picked, "sol_id": task.so_line_id},
             )
 
-    # 5. Update inventory (floor at zero for safety)
-    db.execute(
-        text(
-            """
-            UPDATE inventory
-            SET quantity_on_hand = GREATEST(0, quantity_on_hand - :picked),
-                quantity_allocated = GREATEST(0, quantity_allocated - :allocated),
-                updated_at = NOW()
-            WHERE item_id = :iid AND bin_id = :bid
-            """
-        ),
-        {"picked": quantity_picked, "allocated": task.quantity_to_pick, "iid": task.item_id, "bid": task.bin_id},
-    )
+    # 5. Update inventory (floor at zero for safety).
+    #
+    # SO picks decrement source on_hand + allocated immediately: the
+    # picked stock is committed to the SO and not returnable through
+    # the SO flow.
+    #
+    # TO picks v1.8.0 (#293): inventory does NOT change at pick time.
+    # The TO reservation (quantity_allocated, set at import) persists
+    # through pick + submit; inventory moves source -> destination
+    # only when an admin approves the picker's submission. A
+    # rejection therefore leaves source stock intact for re-pick;
+    # short-close on the line is the operator-side closeout.
+    if task.to_id is None:
+        db.execute(
+            text(
+                """
+                UPDATE inventory
+                SET quantity_on_hand = GREATEST(0, quantity_on_hand - :picked),
+                    quantity_allocated = GREATEST(0, quantity_allocated - :allocated),
+                    updated_at = NOW()
+                WHERE item_id = :iid AND bin_id = :bid
+                """
+            ),
+            {"picked": quantity_picked, "allocated": task.quantity_to_pick, "iid": task.item_id, "bid": task.bin_id},
+        )
 
     # 6. Get remaining count
     remaining = db.execute(
