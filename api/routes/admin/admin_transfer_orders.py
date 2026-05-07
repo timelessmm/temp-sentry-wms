@@ -11,19 +11,24 @@ module orchestrates the admin lifecycle without re-deriving state.
 
 import math
 import uuid
-from typing import Optional
+from typing import List, Optional
 
 from flask import g, jsonify, request
+from psycopg2.errors import UniqueViolation
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 
 from constants import (
     ACTION_TO_CANCELLED,
+    ACTION_TO_CREATED,
     ACTION_TO_DELETED,
     ACTION_TO_LINE_SHORT_CLOSED,
 )
 from middleware.auth_middleware import require_auth, require_role
 from middleware.db import with_db
 from routes.admin import admin_bp
+from schemas.csv_import import TransferOrderImportRow
 from services.audit_service import write_audit_log
 from services.transfer_order_service import (
     TO_LINE_PENDING,
@@ -34,9 +39,31 @@ from services.transfer_order_service import (
     TO_STATUS_CLOSED,
     TO_STATUS_OPEN,
     TO_STATUS_PARTIALLY_PICKED,
+    generate_to_number,
     validate_header_transition,
     validate_line_transition,
 )
+
+
+# ============================================================
+# Import schema
+# ============================================================
+
+
+class _ImportRequest(BaseModel):
+    """Top-level shape for POST /api/admin/transfer-orders/import."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    source_warehouse_code: str = Field(..., min_length=1, max_length=20)
+    destination_warehouse_code: str = Field(..., min_length=1, max_length=20)
+    notes: Optional[str] = Field(None, max_length=2000)
+    records: List[dict] = Field(..., min_length=1, max_length=5000)
+
+    @field_validator("source_warehouse_code", "destination_warehouse_code")
+    @classmethod
+    def _strip(cls, v):
+        return v.strip()
 
 
 # ----------------------------------------------------------------------
@@ -211,11 +238,12 @@ def get_transfer_order(to_id):
 
 
 def _release_reservations(db, to_id: int, source_warehouse_id: int) -> None:
-    """For every line on the TO with committed_qty > 0, decrement
-    inventory.quantity_allocated at the source warehouse so the
-    reservation does not survive the cancellation. Items are processed
-    in deterministic order by item_id to match the importer + picker
-    locking pattern (plan section 4.4)."""
+    """For every line on the TO with committed_qty > approved_qty,
+    decrement inventory.quantity_allocated at the source warehouse so
+    the reservation does not survive the cancellation. Inventory is
+    per-bin so the release walks rows in the same order the import +
+    picker use (inventory_id ASC) and decrements each row up to its
+    own current allocated value."""
     lines = db.execute(
         text(
             """
@@ -230,20 +258,50 @@ def _release_reservations(db, to_id: int, source_warehouse_id: int) -> None:
     for row in lines:
         if row.to_release <= 0:
             continue
+        _release_inventory_allocation(
+            db, row.item_id, source_warehouse_id, row.to_release,
+        )
+
+
+def _release_inventory_allocation(
+    db, item_id: int, warehouse_id: int, delta: int,
+) -> None:
+    """Decrement quantity_allocated across (item, warehouse) inventory
+    rows until ``delta`` units are released. Walks inventory_id ASC
+    under FOR UPDATE so concurrent operations see deterministic lock
+    ordering. Each row gives up at most its own quantity_allocated to
+    avoid driving the column negative."""
+    if delta <= 0:
+        return
+    inv_rows = db.execute(
+        text(
+            """
+            SELECT inv.inventory_id, inv.quantity_allocated
+              FROM inventory inv
+             WHERE inv.item_id = :iid AND inv.warehouse_id = :wid
+               AND inv.quantity_allocated > 0
+             ORDER BY inv.inventory_id ASC
+             FOR UPDATE OF inv
+            """
+        ),
+        {"iid": item_id, "wid": warehouse_id},
+    ).fetchall()
+    remaining = delta
+    for ir in inv_rows:
+        if remaining <= 0:
+            break
+        give = min(remaining, ir.quantity_allocated)
+        if give == 0:
+            continue
         db.execute(
             text(
-                """
-                UPDATE inventory
-                   SET quantity_allocated = quantity_allocated - :delta
-                 WHERE item_id = :iid AND warehouse_id = :wid
-                """
+                "UPDATE inventory "
+                "   SET quantity_allocated = quantity_allocated - :delta "
+                " WHERE inventory_id = :inv_id"
             ),
-            {
-                "delta": row.to_release,
-                "iid": row.item_id,
-                "wid": source_warehouse_id,
-            },
+            {"delta": give, "inv_id": ir.inventory_id},
         )
+        remaining -= give
 
 
 @admin_bp.route("/transfer-orders/<int:to_id>/cancel", methods=["POST"])
@@ -423,19 +481,8 @@ def short_close_to_line(to_id, line_id):
     # transitions to SHORT_CLOSED to lock the remaining out.
     remaining = line.committed_qty - line.approved_qty
     if remaining > 0:
-        g.db.execute(
-            text(
-                """
-                UPDATE inventory
-                   SET quantity_allocated = quantity_allocated - :delta
-                 WHERE item_id = :iid AND warehouse_id = :wid
-                """
-            ),
-            {
-                "delta": remaining,
-                "iid": line.item_id,
-                "wid": line.source_warehouse_id,
-            },
+        _release_inventory_allocation(
+            g.db, line.item_id, line.source_warehouse_id, remaining,
         )
 
     g.db.execute(
@@ -468,3 +515,253 @@ def short_close_to_line(to_id, line_id):
         "status": TO_LINE_SHORT_CLOSED,
         "released_qty": remaining,
     })
+
+
+# ============================================================
+# CSV import (#291)
+# ============================================================
+
+
+def _resolve_warehouse_id(db, code: str) -> Optional[int]:
+    row = db.execute(
+        text(
+            "SELECT warehouse_id FROM warehouses "
+            " WHERE warehouse_code = :code AND is_active = TRUE"
+        ),
+        {"code": code},
+    ).fetchone()
+    return row.warehouse_id if row else None
+
+
+@admin_bp.route("/transfer-orders/import", methods=["POST"])
+@require_auth
+@require_role("ADMIN")
+@with_db
+def import_transfer_order():
+    """Build a single TO from a list of (sku, quantity) records.
+
+    Reservations land in inventory.quantity_allocated at the source
+    warehouse so SO ATP at picking_service.py:106-125 sees the
+    reservation automatically (no SO-side code change). Lines whose
+    requested_qty exceeds available are accepted with
+    committed_qty = available; the response carries a shortage payload
+    so the frontend renders the ShortageModal.
+    """
+
+    try:
+        body = _ImportRequest.model_validate(request.get_json() or {})
+    except ValidationError as exc:
+        return jsonify({
+            "error": "validation_error",
+            "details": exc.errors(include_url=False, include_context=False),
+        }), 422
+
+    if body.source_warehouse_code == body.destination_warehouse_code:
+        return jsonify({
+            "error": "source_and_destination_must_differ",
+            "warehouse_code": body.source_warehouse_code,
+        }), 422
+
+    src_id = _resolve_warehouse_id(g.db, body.source_warehouse_code)
+    if src_id is None:
+        return jsonify({
+            "error": "unknown_warehouse",
+            "field": "source_warehouse_code",
+            "value": body.source_warehouse_code,
+        }), 404
+    dst_id = _resolve_warehouse_id(g.db, body.destination_warehouse_code)
+    if dst_id is None:
+        return jsonify({
+            "error": "unknown_warehouse",
+            "field": "destination_warehouse_code",
+            "value": body.destination_warehouse_code,
+        }), 404
+
+    # Per-row Pydantic + SKU resolution. Aggregate row errors so the
+    # operator sees every bad row at once rather than fixing one at a
+    # time.
+    errors = []
+    rows = []  # list of {row_index, sku, item_id, requested_qty}
+    for idx, raw in enumerate(body.records):
+        try:
+            row = TransferOrderImportRow.model_validate(raw)
+        except ValidationError as exc:
+            errors.append({
+                "row_index": idx,
+                "error_kind": "validation_error",
+                "details": exc.errors(
+                    include_url=False, include_context=False,
+                ),
+            })
+            continue
+        item_row = g.db.execute(
+            text("SELECT item_id FROM items WHERE sku = :sku"),
+            {"sku": row.sku},
+        ).fetchone()
+        if item_row is None:
+            errors.append({
+                "row_index": idx,
+                "error_kind": "unknown_sku",
+                "sku": row.sku,
+            })
+            continue
+        rows.append({
+            "row_index": idx,
+            "sku": row.sku,
+            "item_id": item_row.item_id,
+            "requested_qty": row.quantity,
+        })
+    if errors:
+        return jsonify({
+            "error": "row_errors",
+            "rows": errors,
+        }), 422
+
+    # Sort by item_id ASC before locking inventory. This matches the
+    # picker + cancel-release ordering so concurrent operations
+    # acquire row locks in a deterministic sequence (deadlock
+    # prevention; plan section 4.4).
+    rows.sort(key=lambda r: r["item_id"])
+
+    # Inventory is per-bin (one row per (item_id, bin_id, lot_number))
+    # so the reservation distributes across all rows for (item,
+    # warehouse). Walk rows in inventory_id ASC under FOR UPDATE OF
+    # inv to match the picking_service.py:106-125 lock ordering;
+    # decrement quantity_on_hand-quantity_allocated availability per
+    # row until requested_qty is satisfied or rows exhausted.
+    shortages = []
+    line_inserts = []  # (item_id, line_number, requested, committed)
+    for line_number, row in enumerate(rows, start=1):
+        inv_rows = g.db.execute(
+            text(
+                """
+                SELECT inv.inventory_id, inv.quantity_on_hand,
+                       inv.quantity_allocated
+                  FROM inventory inv
+                 WHERE inv.item_id = :iid AND inv.warehouse_id = :wid
+                 ORDER BY inv.inventory_id ASC
+                 FOR UPDATE OF inv
+                """
+            ),
+            {"iid": row["item_id"], "wid": src_id},
+        ).fetchall()
+        total_available = sum(
+            max(0, ir.quantity_on_hand - ir.quantity_allocated)
+            for ir in inv_rows
+        )
+        committed = max(0, min(row["requested_qty"], total_available))
+        remaining = committed
+        for ir in inv_rows:
+            if remaining <= 0:
+                break
+            avail = max(0, ir.quantity_on_hand - ir.quantity_allocated)
+            take = min(remaining, avail)
+            if take == 0:
+                continue
+            g.db.execute(
+                text(
+                    "UPDATE inventory "
+                    "   SET quantity_allocated = quantity_allocated + :delta "
+                    " WHERE inventory_id = :inv_id"
+                ),
+                {"delta": take, "inv_id": ir.inventory_id},
+            )
+            remaining -= take
+        if committed < row["requested_qty"]:
+            shortages.append({
+                "row_index": row["row_index"],
+                "sku": row["sku"],
+                "requested_qty": row["requested_qty"],
+                "available_qty": total_available,
+                "committed_qty": committed,
+                "shortfall": row["requested_qty"] - committed,
+            })
+        line_inserts.append((
+            row["item_id"], line_number, row["requested_qty"], committed,
+        ))
+
+    # Insert TO header. Same-millisecond collision retried once before
+    # surfacing 500.
+    to_id = None
+    for attempt in range(2):
+        to_number = generate_to_number()
+        try:
+            result = g.db.execute(
+                text(
+                    """
+                    INSERT INTO transfer_orders
+                        (to_number, source_warehouse_id, destination_warehouse_id,
+                         created_by, notes, external_id)
+                    VALUES (:tn, :src, :dst, :cby, :notes, :ext)
+                    RETURNING to_id, to_number
+                    """
+                ),
+                {
+                    "tn": to_number,
+                    "src": src_id,
+                    "dst": dst_id,
+                    "cby": g.current_user["username"],
+                    "notes": body.notes,
+                    "ext": str(uuid.uuid4()),
+                },
+            )
+            row = result.fetchone()
+            to_id = row.to_id
+            to_number = row.to_number
+            break
+        except IntegrityError as exc:
+            g.db.rollback()
+            if isinstance(exc.orig, UniqueViolation) and attempt == 0:
+                continue
+            raise
+    if to_id is None:
+        return jsonify({"error": "to_number_collision"}), 500
+
+    for item_id, line_number, requested, committed in line_inserts:
+        # Pick the line state at insert time: PENDING when fully
+        # committed, SHORT_CLOSED when committed=0 (no available
+        # inventory to commit so the line cannot be picked). Plan
+        # section 4.13 marks committed=0 as a valid shortage path;
+        # the line lands SHORT_CLOSED so it does not block closure
+        # and the operator surfaces it in the shortage modal.
+        line_status = TO_LINE_PENDING if committed > 0 else TO_LINE_SHORT_CLOSED
+        g.db.execute(
+            text(
+                """
+                INSERT INTO transfer_order_lines
+                    (to_id, item_id, line_number, requested_qty,
+                     committed_qty, status)
+                VALUES (:tid, :iid, :ln, :req, :com, :st)
+                """
+            ),
+            {
+                "tid": to_id, "iid": item_id, "ln": line_number,
+                "req": requested, "com": committed, "st": line_status,
+            },
+        )
+
+    write_audit_log(
+        g.db,
+        action_type=ACTION_TO_CREATED,
+        entity_type="TO",
+        entity_id=to_id,
+        user_id=g.current_user["username"],
+        warehouse_id=src_id,
+        details={
+            "to_number": to_number,
+            "source_warehouse_id": src_id,
+            "destination_warehouse_id": dst_id,
+            "line_count": len(line_inserts),
+            "shortage_count": len(shortages),
+        },
+    )
+    g.db.commit()
+
+    return jsonify({
+        "to_id": to_id,
+        "to_number": to_number,
+        "source_warehouse_id": src_id,
+        "destination_warehouse_id": dst_id,
+        "line_count": len(line_inserts),
+        "shortages": shortages,
+    }), 201

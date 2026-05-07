@@ -188,3 +188,23 @@ class SalesOrderImportRow(_BaseImportRow):
 
     def resolved_quantity(self) -> Optional[int]:
         return self.quantity if self.quantity is not None else self.quantity_ordered
+
+
+# ---------------------------------------------------------------------------
+# Transfer orders (v1.8.0 #291)
+# ---------------------------------------------------------------------------
+
+
+class TransferOrderImportRow(_BaseImportRow):
+    """One row in the TO CSV import. Header-level fields (source +
+    destination warehouse code, optional notes) live on the import
+    request, not the row, so the route's header-consistency check is
+    automatic by request-shape rather than row-by-row aggregation."""
+
+    sku: str = Field(..., min_length=1, max_length=128)
+    quantity: int = Field(..., gt=0, le=1000000)
+
+    @field_validator("sku", mode="before")
+    @classmethod
+    def _no_formula(cls, v):
+        return _reject_formula_prefix(v)
