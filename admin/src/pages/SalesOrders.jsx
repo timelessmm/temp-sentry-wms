@@ -8,6 +8,45 @@ import StatusTag from '../components/StatusTag.jsx';
 
 const STATUS_OPTIONS = ['All', 'OPEN', 'ALLOCATED', 'PICKING', 'PICKED', 'PACKING', 'PACKED', 'SHIPPED', 'CANCELLED'];
 
+// v1.8.0 (#268) per-component billing/shipping address fields. Order
+// must match the canonical column ordering for round-trip consistency.
+const ADDRESS_FIELD_KEYS = [
+  'billing_address_name', 'billing_address_line1', 'billing_address_line2',
+  'billing_address_city', 'billing_address_state',
+  'billing_address_postal_code', 'billing_address_country',
+  'billing_address_phone',
+  'shipping_address_name', 'shipping_address_line1', 'shipping_address_line2',
+  'shipping_address_city', 'shipping_address_state',
+  'shipping_address_postal_code', 'shipping_address_country',
+  'shipping_address_phone',
+];
+
+const ADDRESS_FIELD_LABELS = {
+  billing_address_name: 'Name',
+  billing_address_line1: 'Line 1',
+  billing_address_line2: 'Line 2',
+  billing_address_city: 'City',
+  billing_address_state: 'State / Region',
+  billing_address_postal_code: 'Postal Code',
+  billing_address_country: 'Country',
+  billing_address_phone: 'Phone',
+  shipping_address_name: 'Name',
+  shipping_address_line1: 'Line 1',
+  shipping_address_line2: 'Line 2',
+  shipping_address_city: 'City',
+  shipping_address_state: 'State / Region',
+  shipping_address_postal_code: 'Postal Code',
+  shipping_address_country: 'Country',
+  shipping_address_phone: 'Phone',
+};
+
+function NullableValue({ value }) {
+  if (value === null || value === undefined || value === '') {
+    return <span style={{ color: 'var(--text-secondary)' }}>-</span>;
+  }
+  return <span>{value}</span>;
+}
+
 export default function SalesOrders() {
   const [searchParams] = useSearchParams();
   const [search, setSearch] = useState(searchParams.get('q') || '');
@@ -21,6 +60,14 @@ export default function SalesOrders() {
   const [editForm, setEditForm] = useState({});
   const [editError, setEditError] = useState('');
   const [confirmCancel, setConfirmCancel] = useState(false);
+  // v1.8.0 (#268) address edit: separate modal that calls PATCH
+  // /sales-orders/<so_id>/address. Backend status gate: ADMIN at any
+  // status, non-admin only at OPEN. Addresses live on the canonical
+  // header so customer-service edits can land post-PICKED for
+  // shipping fixes.
+  const [addressEditing, setAddressEditing] = useState(null);
+  const [addressForm, setAddressForm] = useState({});
+  const [addressError, setAddressError] = useState('');
 
   useEffect(() => { loadOrders(); }, [page, statusFilter, search]);  // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -75,6 +122,46 @@ export default function SalesOrders() {
     } else {
       const data = await res?.json();
       setEditError(data?.error || 'Failed to save');
+    }
+  }
+
+  function openAddressEdit(so) {
+    setAddressEditing(so);
+    const form = {};
+    for (const key of ADDRESS_FIELD_KEYS) {
+      form[key] = so[key] || '';
+    }
+    setAddressForm(form);
+    setAddressError('');
+  }
+
+  async function saveAddressEdit() {
+    setAddressError('');
+    // Empty string clears the column to NULL on the backend; we send
+    // every field that the operator could have edited so a deletion
+    // is also persisted.
+    const body = {};
+    for (const key of ADDRESS_FIELD_KEYS) {
+      body[key] = addressForm[key] || '';
+    }
+    const res = await api.patch(
+      `/admin/sales-orders/${addressEditing.so_id}/address`,
+      body,
+    );
+    if (res?.ok) {
+      setAddressEditing(null);
+      // Refresh detail modal to show the saved values.
+      const refresh = await api.get(
+        `/admin/sales-orders/${addressEditing.so_id}`,
+      );
+      if (refresh?.ok) {
+        const data = await refresh.json();
+        setSelectedSO(data.sales_order);
+        setSOLines(data.lines || []);
+      }
+    } else {
+      const data = await res?.json();
+      setAddressError(data?.error || 'Failed to save addresses');
     }
   }
 
@@ -145,6 +232,56 @@ export default function SalesOrders() {
             <span className="detail-label">Ship By</span><span className="mono">{selectedSO.ship_by_date ? new Date(selectedSO.ship_by_date).toLocaleDateString() : '-'}</span>
             <span className="detail-label">Ship Method</span><span>{selectedSO.ship_method || '-'}</span>
             <span className="detail-label">Ship Address</span><span>{selectedSO.ship_address || '-'}</span>
+            {/* v1.8.0 (#282) per-order cost fields. order_total +
+                customer_shipping_paid arrive as strings on the wire to
+                preserve Decimal precision; render literal. */}
+            <span className="detail-label">Order Total</span>
+            <span className="mono"><NullableValue value={selectedSO.order_total} /></span>
+            <span className="detail-label">Shipping Paid</span>
+            <span className="mono"><NullableValue value={selectedSO.customer_shipping_paid} /></span>
+          </div>
+
+          {/* v1.8.0 (#268) per-component billing + shipping addresses.
+              Each side gets its own card so a half-populated address
+              renders cleanly without column shifts. */}
+          <div style={{
+            display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16,
+            marginBottom: 16,
+          }}>
+            <div>
+              <div style={{
+                display: 'flex', justifyContent: 'space-between',
+                alignItems: 'center', marginBottom: 8,
+              }}>
+                <strong style={{ fontSize: 13 }}>Billing Address</strong>
+                <button
+                  className="btn btn-sm"
+                  onClick={() => openAddressEdit(selectedSO)}
+                  title="Edit billing + shipping addresses"
+                >Edit Addresses</button>
+              </div>
+              <div className="detail-grid">
+                {ADDRESS_FIELD_KEYS.filter((k) => k.startsWith('billing_')).map((k) => (
+                  <span key={k} style={{ display: 'contents' }}>
+                    <span className="detail-label">{ADDRESS_FIELD_LABELS[k]}</span>
+                    <span><NullableValue value={selectedSO[k]} /></span>
+                  </span>
+                ))}
+              </div>
+            </div>
+            <div>
+              <strong style={{
+                fontSize: 13, marginBottom: 8, display: 'block',
+              }}>Shipping Address</strong>
+              <div className="detail-grid">
+                {ADDRESS_FIELD_KEYS.filter((k) => k.startsWith('shipping_')).map((k) => (
+                  <span key={k} style={{ display: 'contents' }}>
+                    <span className="detail-label">{ADDRESS_FIELD_LABELS[k]}</span>
+                    <span><NullableValue value={selectedSO[k]} /></span>
+                  </span>
+                ))}
+              </div>
+            </div>
           </div>
 
           {soLines.length > 0 ? (
@@ -173,6 +310,58 @@ export default function SalesOrders() {
           ) : (
             <p style={{ fontSize: 13, color: 'var(--text-secondary)' }}>No line items</p>
           )}
+        </Modal>
+      )}
+
+      {addressEditing && (
+        <Modal
+          title={`Edit Addresses - SO ${addressEditing.so_number}`}
+          onClose={() => setAddressEditing(null)}
+          footer={
+            <>
+              <button className="btn" onClick={() => setAddressEditing(null)}>Cancel</button>
+              <button className="btn btn-primary" onClick={saveAddressEdit}>Save Addresses</button>
+            </>
+          }
+        >
+          {addressError && <div className="form-error" style={{ marginBottom: 12 }}>{addressError}</div>}
+          <p style={{ fontSize: 12, color: 'var(--text-secondary)', marginBottom: 12 }}>
+            Address edits go through a dedicated endpoint with a status
+            gate: ADMIN can edit at any status, non-admin only on OPEN
+            orders. Empty fields are saved as cleared. Header fields
+            (SO number, customer, ship method) are edited via the main
+            Edit button and remain locked once picking starts.
+          </p>
+          <div style={{
+            display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16,
+          }}>
+            <div>
+              <strong style={{ display: 'block', marginBottom: 8 }}>Billing</strong>
+              {ADDRESS_FIELD_KEYS.filter((k) => k.startsWith('billing_')).map((k) => (
+                <div key={k} className="form-group">
+                  <label>{ADDRESS_FIELD_LABELS[k]}</label>
+                  <input
+                    className="form-input"
+                    value={addressForm[k]}
+                    onChange={(e) => setAddressForm({ ...addressForm, [k]: e.target.value })}
+                  />
+                </div>
+              ))}
+            </div>
+            <div>
+              <strong style={{ display: 'block', marginBottom: 8 }}>Shipping</strong>
+              {ADDRESS_FIELD_KEYS.filter((k) => k.startsWith('shipping_')).map((k) => (
+                <div key={k} className="form-group">
+                  <label>{ADDRESS_FIELD_LABELS[k]}</label>
+                  <input
+                    className="form-input"
+                    value={addressForm[k]}
+                    onChange={(e) => setAddressForm({ ...addressForm, [k]: e.target.value })}
+                  />
+                </div>
+              ))}
+            </div>
+          </div>
         </Modal>
       )}
 
