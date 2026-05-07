@@ -384,6 +384,47 @@ def handle_inbound(
         write_field_set,
     )
 
+    # ----- Step 6.5: line-item write-through (v1.8.0 #289) -----
+    # PO + SO resources flow line_items through to the relational
+    # *_lines tables so receiving / picking can scan against them.
+    # Other resources (items / customers / vendors) have no line tables
+    # and the helper short-circuits.
+    try:
+        _write_inbound_lines(
+            db, document, resource_key, canonical_id, canonical_payload,
+        )
+    except CrossSystemLookupMiss as miss:
+        return HandlerError(
+            status_code=409,
+            body={
+                "error_kind": "cross_system_lookup_miss",
+                "missing": {
+                    "source_system": miss.source_system,
+                    "source_type": miss.source_type,
+                    "source_id": miss.source_id,
+                },
+                "message": (
+                    "Required cross-system lookup did not resolve on a "
+                    "line item. Ensure the referenced entity has been "
+                    "ingested."
+                ),
+            },
+        )
+    except _LinesInFlight as exc:
+        return HandlerError(
+            status_code=409,
+            body={
+                "error_kind": "lines_in_flight",
+                "message": str(exc),
+            },
+        )
+    except ValueError as exc:
+        return HandlerError(
+            status_code=422,
+            body={"error_kind": "mapping_apply_error",
+                  "message": str(exc)},
+        )
+
     # ----- Step 7: insert inbound row + supersede -----
     db.execute(
         text(
@@ -611,3 +652,198 @@ def _write_audit_log(
             "d": json.dumps(details, default=_json_default),
         },
     )
+
+
+# ============================================================
+# v1.8.0 (#289) Line-item write-through
+# ============================================================
+#
+# v1.7 stored line_items only in inbound_<resource>.canonical_payload
+# JSONB; the relational *_lines tables stayed empty, leaving inbound
+# POs unreceivable and inbound SOs unallocatable. v1.8 walks the
+# resolved canonical_payload[<canonical_path>] list after the header
+# upsert and writes lines to purchase_order_lines / sales_order_lines
+# with FK to the just-upserted header.
+#
+# Items / customers / vendors do not have line_items wiring; the
+# helper short-circuits.
+
+
+class _LinesInFlight(Exception):
+    """Existing lines have downstream activity (PO: quantity_received
+    > 0; SO: any quantity_(allocated|picked|packed|shipped) > 0).
+    Replacing them would silently lose the warehouse-floor state, so
+    the handler returns 409 instead. Operator cancels or completes the
+    in-flight work before re-POSTing the upstream record."""
+
+
+_LINE_RESOURCE_SPECS = {
+    "purchase_orders": {
+        "header_pk_col": "po_id",
+        "line_table": "purchase_order_lines",
+        "downstream_predicate": "quantity_received > 0",
+        "downstream_label": "quantity_received",
+    },
+    "sales_orders": {
+        "header_pk_col": "so_id",
+        "line_table": "sales_order_lines",
+        "downstream_predicate": (
+            "quantity_allocated > 0 OR quantity_picked > 0 "
+            "OR quantity_packed > 0 OR quantity_shipped > 0"
+        ),
+        "downstream_label": "quantity_allocated/picked/packed/shipped",
+    },
+}
+
+
+def _resolve_item_int_id(db, item_external_id) -> Optional[int]:
+    """Translate an items.external_id UUID to the integer items.item_id
+    FK target. Returns None when no row matches; caller raises
+    CrossSystemLookupMiss with the unresolved UUID."""
+    if item_external_id is None:
+        return None
+    row = db.execute(
+        text("SELECT item_id FROM items WHERE external_id = :eid"),
+        {"eid": str(item_external_id)},
+    ).fetchone()
+    return row.item_id if row else None
+
+
+def _write_inbound_lines(db, document, resource_key, canonical_id,
+                          canonical_payload) -> None:
+    """v1.8.0 (#289): write inbound lines to the relational *_lines
+    table for purchase_orders + sales_orders.
+
+    No-op when:
+    - the resource has no line wiring (items / customers / vendors), OR
+    - the mapping doc declares no line_items block, OR
+    - the resolved line list is empty (header-only update; preserves
+      existing relational lines so a metadata re-POST does not nuke
+      receiving / picking work).
+
+    Raises:
+    - CrossSystemLookupMiss when a line's item_id (canonical UUID)
+      does not resolve to an items row.
+    - _LinesInFlight when existing lines have downstream activity
+      and replacement would lose state.
+    - ValueError on mapping shape errors (missing item_id / quantity
+      on a line) so the handler can surface a 422 with a clear
+      message.
+    """
+    spec = _LINE_RESOURCE_SPECS.get(resource_key)
+    if spec is None:
+        return  # items / customers / vendors
+
+    rm = document.resources.get(resource_key)
+    if rm is None or rm.line_items is None:
+        return  # mapping doc declares no line_items block
+
+    lines = canonical_payload.get(rm.line_items.canonical_path) or []
+    if not lines:
+        return  # header-only update preserves existing relational lines
+
+    # Resolve integer header PK; the just-upserted row must exist.
+    header_pk_col = spec["header_pk_col"]
+    canonical_table = resource_key  # plural form == canonical table name
+    header_row = db.execute(
+        text(
+            f"SELECT {header_pk_col} FROM {canonical_table} "
+            f" WHERE external_id = :cid"
+        ),
+        {"cid": str(canonical_id)},
+    ).fetchone()
+    if header_row is None:
+        raise RuntimeError(
+            f"line write-through: {canonical_table} row missing for "
+            f"canonical_id={canonical_id}"
+        )
+    header_pk = getattr(header_row, header_pk_col)
+
+    # Downstream-activity gate.
+    line_table = spec["line_table"]
+    in_flight = db.execute(
+        text(
+            f"SELECT COUNT(*) FROM {line_table} "
+            f" WHERE {header_pk_col} = :hpk "
+            f"   AND ({spec['downstream_predicate']})"
+        ),
+        {"hpk": header_pk},
+    ).scalar()
+    if in_flight > 0:
+        raise _LinesInFlight(
+            f"{resource_key}: {in_flight} existing line(s) on "
+            f"{header_pk_col}={header_pk} have downstream activity "
+            f"({spec['downstream_label']}). Cancel or complete the "
+            f"in-flight work before re-POST."
+        )
+
+    # Resolve each line: item UUID -> integer item_id; required quantity.
+    resolved: List[Dict[str, Any]] = []
+    for idx, line in enumerate(lines):
+        item_uuid = line.get("item_id")
+        if item_uuid is None:
+            raise ValueError(
+                f"{resource_key} line {idx}: item_id is required "
+                "(declare cross_system_lookup on the line_items field)"
+            )
+        item_int_id = _resolve_item_int_id(db, item_uuid)
+        if item_int_id is None:
+            raise CrossSystemLookupMiss(
+                source_system=document.source_system,
+                source_type="item",
+                source_id=str(item_uuid),
+            )
+        qty = line.get("quantity_ordered")
+        if qty is None:
+            raise ValueError(
+                f"{resource_key} line {idx}: quantity_ordered is required"
+            )
+        try:
+            qty_int = int(qty)
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"{resource_key} line {idx}: quantity_ordered "
+                f"{qty!r} is not an integer"
+            )
+        if qty_int <= 0:
+            raise ValueError(
+                f"{resource_key} line {idx}: quantity_ordered must be > 0"
+            )
+        line_number = line.get("line_number")
+        if line_number is None:
+            line_number = idx + 1
+        resolved.append({
+            "hpk": header_pk,
+            "item_id": item_int_id,
+            "qty": qty_int,
+            "ln": int(line_number),
+        })
+
+    # Replace lines: DELETE existing + INSERT new. Both purchase_order_lines
+    # and sales_order_lines accept (header_pk, item_id, quantity_ordered,
+    # line_number); other columns default. Items / customers / vendors are
+    # excluded above so the literal column lists below are exhaustive.
+    db.execute(
+        text(f"DELETE FROM {line_table} WHERE {header_pk_col} = :hpk"),
+        {"hpk": header_pk},
+    )
+    if resource_key == "purchase_orders":
+        for params in resolved:
+            db.execute(
+                text(
+                    "INSERT INTO purchase_order_lines "
+                    "(po_id, item_id, quantity_ordered, line_number) "
+                    "VALUES (:hpk, :item_id, :qty, :ln)"
+                ),
+                params,
+            )
+    else:  # sales_orders
+        for params in resolved:
+            db.execute(
+                text(
+                    "INSERT INTO sales_order_lines "
+                    "(so_id, item_id, quantity_ordered, line_number) "
+                    "VALUES (:hpk, :item_id, :qty, :ln)"
+                ),
+                params,
+            )

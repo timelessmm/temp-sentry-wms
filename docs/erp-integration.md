@@ -142,6 +142,62 @@ a single connector, not shared with humans or pasted into runbooks.
 Rotate the token if the override list needs to change and you want
 the previous shape invalidated atomically.
 
+## v1.8.0: line items write through to relational tables
+
+For `purchase_orders` and `sales_orders`, the inbound handler now
+writes resolved line items to the relational `purchase_order_lines`
+/ `sales_order_lines` tables (v1.8.0 #289). v1.7 stored lines only
+in `inbound_<resource>.canonical_payload` JSONB; receiving had
+nothing to scan against and picking had no allocation target.
+
+### Required line shape
+
+The mapping doc's `line_items` block must declare these canonical
+fields per line:
+
+- `item_id` -- the canonical item UUID. Use `cross_system_lookup`
+  with `source_type: item` so the source-system SKU translates to
+  the canonical UUID. Items must already exist in Sentry +
+  `cross_system_mappings` (via prior `/api/v1/inbound/items` POST
+  or admin UI item create) for the lookup to resolve.
+- `quantity_ordered` -- positive integer.
+
+`line_number` auto-assigns 1..N when omitted; declare it explicitly
+to honor the source's ordering. Other line columns
+(`quantity_received` for PO; `quantity_allocated` /
+`quantity_picked` / `quantity_packed` / `quantity_shipped` for SO)
+default to 0; downstream Sentry workflows update them.
+
+### Idempotency on re-POST
+
+A re-POST with the same `external_id` (newer `external_version`)
+replaces existing lines via DELETE + INSERT, but only when no
+downstream activity exists. The handler returns `409
+lines_in_flight` if:
+
+- PO: any line has `quantity_received > 0`, OR
+- SO: any line has `quantity_allocated`, `quantity_picked`,
+  `quantity_packed`, or `quantity_shipped > 0`.
+
+Operators cancel or complete the in-flight work (or reverse the
+receiving step) before re-POSTing. The canonical header upsert
+rolls back via the outer transaction, so the v1 line state is
+preserved.
+
+### Empty `line_items` array on re-POST
+
+A re-POST with an empty `lineItems` source array preserves
+existing lines. This allows header-only updates (e.g., status
+change, carrier update on SO) without nuking the line list.
+
+### Item resolution misses
+
+If `cross_system_lookup` on a line's `item_id` does not resolve
+(no `cross_system_mappings` row for the source SKU), the handler
+returns `409 cross_system_lookup_miss` with `source_type: item`
+and the unresolved SKU. Operators ingest the missing item first,
+then retry the PO / SO.
+
 ## See also
 
 - [Annotated mapping template](https://github.com/hightower-systems/sentry-wms/blob/main/db/mappings/example-template.yaml.template)
