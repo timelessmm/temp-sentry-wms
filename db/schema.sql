@@ -190,12 +190,28 @@ CREATE TABLE sales_orders (
     warehouse_id INT NOT NULL REFERENCES warehouses(warehouse_id),
     ship_method VARCHAR(50),
     ship_address VARCHAR(500),
-    -- v1.7.0 (#266): per-order ecommerce ship-to / bill-to. ship_address
-    -- above stays the warehouse-floor field used by pick/pack/ship;
-    -- shipping_address + billing_address are the canonical values
-    -- inbound consumers populate (per-order, not per-customer).
-    billing_address TEXT,
-    shipping_address TEXT,
+    -- v1.8.0 (#288): per-order ecommerce ship-to / bill-to with each
+    -- address component in its own column so operators (and the inbound
+    -- mapping docs) can address them independently. Replaces the v1.7
+    -- mig 046 billing_address / shipping_address TEXT placeholders.
+    -- ship_address above stays the warehouse-floor field used by
+    -- pick/pack/ship.
+    billing_address_name        VARCHAR(200),
+    billing_address_line1       VARCHAR(200),
+    billing_address_line2       VARCHAR(200),
+    billing_address_city        VARCHAR(100),
+    billing_address_state       VARCHAR(100),
+    billing_address_postal_code VARCHAR(32),
+    billing_address_country     VARCHAR(64),
+    billing_address_phone       VARCHAR(64),
+    shipping_address_name        VARCHAR(200),
+    shipping_address_line1       VARCHAR(200),
+    shipping_address_line2       VARCHAR(200),
+    shipping_address_city        VARCHAR(100),
+    shipping_address_state       VARCHAR(100),
+    shipping_address_postal_code VARCHAR(32),
+    shipping_address_country     VARCHAR(64),
+    shipping_address_phone       VARCHAR(64),
     -- v1.8.0 (#282): values from the source ERP. Currency implied per
     -- Sentry instance (no per-order currency in v1.8). Wire-level
     -- range / precision validation lives in the Pydantic inbound

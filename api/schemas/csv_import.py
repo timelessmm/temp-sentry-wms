@@ -148,9 +148,38 @@ class SalesOrderImportRow(_BaseImportRow):
     customer: Optional[str] = Field(None, max_length=256)
     customer_phone: Optional[str] = Field(None, max_length=64)
     customer_address: Optional[str] = Field(None, max_length=512)
+    # v1.8.0 (#288): per-order billing + shipping addresses, one column
+    # per component. CSV column names match canonical column names so
+    # import / export round-trips. max_length matches the canonical
+    # VARCHAR exactly. Each field is independently formula-protected
+    # via _BaseImportRow.
+    billing_address_name:        Optional[str] = Field(None, max_length=200)
+    billing_address_line1:       Optional[str] = Field(None, max_length=200)
+    billing_address_line2:       Optional[str] = Field(None, max_length=200)
+    billing_address_city:        Optional[str] = Field(None, max_length=100)
+    billing_address_state:       Optional[str] = Field(None, max_length=100)
+    billing_address_postal_code: Optional[str] = Field(None, max_length=32)
+    billing_address_country:     Optional[str] = Field(None, max_length=64)
+    billing_address_phone:       Optional[str] = Field(None, max_length=64)
+    shipping_address_name:        Optional[str] = Field(None, max_length=200)
+    shipping_address_line1:       Optional[str] = Field(None, max_length=200)
+    shipping_address_line2:       Optional[str] = Field(None, max_length=200)
+    shipping_address_city:        Optional[str] = Field(None, max_length=100)
+    shipping_address_state:       Optional[str] = Field(None, max_length=100)
+    shipping_address_postal_code: Optional[str] = Field(None, max_length=32)
+    shipping_address_country:     Optional[str] = Field(None, max_length=64)
+    shipping_address_phone:       Optional[str] = Field(None, max_length=64)
 
     @field_validator(
         "so_number", "sku", "customer", "customer_phone", "customer_address",
+        "billing_address_name", "billing_address_line1", "billing_address_line2",
+        "billing_address_city", "billing_address_state",
+        "billing_address_postal_code", "billing_address_country",
+        "billing_address_phone",
+        "shipping_address_name", "shipping_address_line1", "shipping_address_line2",
+        "shipping_address_city", "shipping_address_state",
+        "shipping_address_postal_code", "shipping_address_country",
+        "shipping_address_phone",
         mode="before",
     )
     @classmethod

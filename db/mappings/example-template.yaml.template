@@ -198,13 +198,75 @@ resources:
         type: "iso_timestamp"
         required: false
 
-      - canonical: "billing_address"
-        source_path: "$.billing.address"
+      # ----- v1.8.0 (#288): structured billing + shipping address -----
+      # Replaces the v1.7 single-TEXT billing_address / shipping_address
+      # placeholders. Each address component maps to its own canonical
+      # column so operators can edit, query, and export per-component.
+      # All 16 fields are optional; absent canonical columns store NULL.
+
+      - canonical: "billing_address_name"
+        source_path: "$.billing.name"
+        type: "string"
+        required: false
+      - canonical: "billing_address_line1"
+        source_path: "$.billing.address.line1"
+        type: "string"
+        required: false
+      - canonical: "billing_address_line2"
+        source_path: "$.billing.address.line2"
+        type: "string"
+        required: false
+      - canonical: "billing_address_city"
+        source_path: "$.billing.address.city"
+        type: "string"
+        required: false
+      - canonical: "billing_address_state"
+        source_path: "$.billing.address.state"   # state / province / region (free text)
+        type: "string"
+        required: false
+      - canonical: "billing_address_postal_code"
+        source_path: "$.billing.address.zip"
+        type: "string"
+        required: false
+      - canonical: "billing_address_country"
+        source_path: "$.billing.address.country"  # ISO-3166 code or country name; operator convention
+        type: "string"
+        required: false
+      - canonical: "billing_address_phone"
+        source_path: "$.billing.phone"
         type: "string"
         required: false
 
-      - canonical: "shipping_address"
-        source_path: "$.shipping.address"
+      - canonical: "shipping_address_name"
+        source_path: "$.shipping.name"
+        type: "string"
+        required: false
+      - canonical: "shipping_address_line1"
+        source_path: "$.shipping.address.line1"
+        type: "string"
+        required: false
+      - canonical: "shipping_address_line2"
+        source_path: "$.shipping.address.line2"
+        type: "string"
+        required: false
+      - canonical: "shipping_address_city"
+        source_path: "$.shipping.address.city"
+        type: "string"
+        required: false
+      - canonical: "shipping_address_state"
+        source_path: "$.shipping.address.state"
+        type: "string"
+        required: false
+      - canonical: "shipping_address_postal_code"
+        source_path: "$.shipping.address.zip"
+        type: "string"
+        required: false
+      - canonical: "shipping_address_country"
+        source_path: "$.shipping.address.country"
+        type: "string"
+        required: false
+      - canonical: "shipping_address_phone"
+        source_path: "$.shipping.phone"
         type: "string"
         required: false
 

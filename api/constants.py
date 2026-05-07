@@ -111,6 +111,13 @@ ACTION_WEBHOOK_DELIVERY_REPLAY_BATCH = "WEBHOOK_DELIVERY_REPLAY_BATCH"
 # the bad column in audit_log without grepping daemon logs.
 ACTION_WEBHOOK_SUBSCRIPTION_AUTO_PAUSE = "WEBHOOK_SUBSCRIPTION_AUTO_PAUSE"
 
+# v1.8.0 (#288) sales_order address edits. One audit row per edited
+# field carrying {field_changed, old_value, new_value} in details so
+# investigators can reconstruct who changed what without scanning the
+# 16-column row diff. PII-careful: only changed fields are recorded,
+# not the full address.
+ACTION_SO_ADDRESS_EDITED = "SO_ADDRESS_EDITED"
+
 # Bin types
 BIN_STAGING = "Staging"
 BIN_PICKABLE_STAGING = "PickableStaging"

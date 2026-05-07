@@ -10,12 +10,20 @@ from constants import (
     PO_OPEN, PO_CLOSED, SO_OPEN, SO_PICKING, SO_PICKED, SO_PACKED, SO_CANCELLED,
     TASK_PENDING, ADJ_PENDING,
     ACTION_PICK,
+    ACTION_SO_ADDRESS_EDITED,
+    ROLE_ADMIN,
 )
 from middleware.auth_middleware import require_auth, require_role
 from middleware.db import with_db
 from routes.admin import admin_bp
 from schemas.purchase_orders import CreatePurchaseOrderRequest, UpdatePurchaseOrderRequest
-from schemas.sales_orders import CreateSalesOrderRequest, UpdateSalesOrderRequest
+from schemas.sales_orders import (
+    ADDRESS_FIELD_NAMES,
+    CreateSalesOrderRequest,
+    UpdateSalesOrderAddressRequest,
+    UpdateSalesOrderRequest,
+)
+from services.audit_service import write_audit_log
 from utils.validation import validate_body
 
 
@@ -314,7 +322,22 @@ def list_sales_orders():
 @with_db
 def get_sales_order(so_id):
     so = g.db.execute(
-        text("SELECT so_id, so_number, so_barcode, customer_name, status, priority, warehouse_id, ship_method, ship_address, order_date, ship_by_date, created_at, picked_at, packed_at, shipped_at, created_by FROM sales_orders WHERE so_id = :sid"),
+        text("""
+            SELECT so_id, so_number, so_barcode, customer_name, status, priority,
+                   warehouse_id, ship_method, ship_address,
+                   order_date, ship_by_date, created_at, picked_at, packed_at,
+                   shipped_at, created_by,
+                   order_total, customer_shipping_paid,
+                   billing_address_name, billing_address_line1, billing_address_line2,
+                   billing_address_city, billing_address_state,
+                   billing_address_postal_code, billing_address_country,
+                   billing_address_phone,
+                   shipping_address_name, shipping_address_line1, shipping_address_line2,
+                   shipping_address_city, shipping_address_state,
+                   shipping_address_postal_code, shipping_address_country,
+                   shipping_address_phone
+              FROM sales_orders WHERE so_id = :sid
+        """),
         {"sid": so_id},
     ).fetchone()
     if not so:
@@ -339,6 +362,16 @@ def get_sales_order(so_id):
             "ship_by_date": so.ship_by_date.isoformat() if so.ship_by_date else None,
             "created_at": so.created_at.isoformat() if so.created_at else None,
             "created_by": so.created_by,
+            # v1.8.0 (#282): per-order cost fields. Null vs 0.00 is
+            # distinct (not provided vs explicitly zero). Decimal
+            # serialised as string so the JSON does not lose precision.
+            "order_total": str(so.order_total) if so.order_total is not None else None,
+            "customer_shipping_paid": (
+                str(so.customer_shipping_paid)
+                if so.customer_shipping_paid is not None else None
+            ),
+            # v1.8.0 (#288): structured billing/shipping address fields.
+            **{name: getattr(so, name) for name in ADDRESS_FIELD_NAMES},
         },
         "lines": [
             {"so_line_id": l.so_line_id, "line_number": l.line_number, "item_id": l.item_id,
@@ -439,6 +472,81 @@ def update_sales_order(so_id, validated):
         "customer_name": row.customer_name, "status": row.status,
         "warehouse_id": row.warehouse_id, "ship_method": row.ship_method,
         "ship_address": row.ship_address, "created_at": row.created_at.isoformat() if row.created_at else None,
+    })
+
+
+@admin_bp.route("/sales-orders/<int:so_id>/address", methods=["PATCH"])
+@require_auth
+@validate_body(UpdateSalesOrderAddressRequest)
+@with_db
+def update_sales_order_address(so_id, validated):
+    """v1.8.0 (#288): edit the 16 structured billing/shipping address
+    fields on a sales_order. Status gate: ADMIN can edit at any
+    status; non-admin only at status='OPEN'. One audit row per
+    actually-changed field carrying {field_changed, old_value,
+    new_value} so investigators can reconstruct the diff without
+    scanning the 16-column row state.
+    """
+    role = g.current_user.get("role")
+
+    so = g.db.execute(
+        text(f"""
+            SELECT so_id, status, warehouse_id,
+                   {", ".join(ADDRESS_FIELD_NAMES)}
+              FROM sales_orders WHERE so_id = :sid FOR UPDATE
+        """),
+        {"sid": so_id},
+    ).fetchone()
+    if not so:
+        return jsonify({"error": "Sales order not found"}), 404
+    if role != ROLE_ADMIN and so.status != SO_OPEN:
+        return jsonify({
+            "error": "non-admin can only edit address on OPEN sales orders",
+            "current_status": so.status,
+        }), 403
+
+    data = validated.model_dump(exclude_unset=True)
+    if not data:
+        return jsonify({"error": "no address fields provided"}), 400
+
+    fields, params, edits = [], {"sid": so_id}, []
+    for col, new_value in data.items():
+        old_value = getattr(so, col)
+        # Treat empty string as explicit clear -> NULL.
+        normalized_new = new_value if new_value != "" else None
+        if old_value == normalized_new:
+            continue
+        fields.append(f"{col} = :{col}")
+        params[col] = normalized_new
+        edits.append((col, old_value, normalized_new))
+
+    if not fields:
+        return jsonify({"unchanged": True}), 200
+
+    g.db.execute(
+        text(f"UPDATE sales_orders SET {', '.join(fields)} WHERE so_id = :sid"),
+        params,
+    )
+
+    for field_changed, old_value, new_value in edits:
+        write_audit_log(
+            g.db,
+            action_type=ACTION_SO_ADDRESS_EDITED,
+            entity_type="SO",
+            entity_id=so_id,
+            user_id=g.current_user["username"],
+            warehouse_id=so.warehouse_id,
+            details={
+                "field_changed": field_changed,
+                "old_value": old_value,
+                "new_value": new_value,
+            },
+        )
+
+    g.db.commit()
+    return jsonify({
+        "so_id": so_id,
+        "edited_fields": [e[0] for e in edits],
     })
 
 
