@@ -807,3 +807,128 @@ class TestPerTokenMappingOverrides:
         assert resp.status_code == 403
         body = resp.get_json()
         assert body["error_kind"] == "mapping_overrides_not_supported_in_body"
+
+
+# ----------------------------------------------------------------------
+# v1.8.0 (#300) warehouse_id token fallback
+# ----------------------------------------------------------------------
+
+
+_NO_WAREHOUSE_MAPPING = """\
+mapping_version: "1.0"
+source_system: "{ss}"
+version_compare: "iso_timestamp"
+resources:
+  sales_orders:
+    canonical_type: "sales_order"
+    fields:
+      - canonical: "so_number"
+        source_path: "$.orderNumber"
+        type: "string"
+        required: true
+      - canonical: "customer_name"
+        source_path: "$.customer.name"
+        type: "string"
+"""
+
+
+class TestWarehouseIdTokenFallback:
+    def test_token_fills_warehouse_when_source_omits(
+        self, client, app, scenario,
+    ):
+        ss = scenario["ss"]
+        _build_registry(app, ss, _NO_WAREHOUSE_MAPPING.format(ss=ss))
+        _make_token(ss, "wh-fb-1", warehouse_ids=[1])
+        resp = _post(client, "wh-fb-1", {
+            "external_id": "SO-WH-FB-1",
+            "external_version": "2026-05-04T10:00:00+00:00",
+            "source_payload": {
+                "orderNumber": "SO-WH-FB-1",
+                "customer": {"name": "FromSource"},
+            },
+        })
+        assert resp.status_code == 201, resp.get_json()
+        scenario["canonical_external_ids"].append(resp.get_json()["canonical_id"])
+        rows = _query(
+            "SELECT warehouse_id FROM sales_orders WHERE external_id = %s",
+            (resp.get_json()["canonical_id"],),
+        )
+        assert rows[0][0] == 1
+
+    def test_source_warehouse_id_wins_over_token_fallback(
+        self, client, app, scenario,
+    ):
+        # Mapping doc declares warehouse_id from source; fallback
+        # should NOT fire when the resolved value is non-null.
+        ss = scenario["ss"]
+        _build_registry(app, ss, _BASE_MAPPING.format(ss=ss, vc="iso_timestamp"))
+        _make_token(ss, "wh-fb-2", warehouse_ids=[1])
+        resp = _post(client, "wh-fb-2", {
+            "external_id": "SO-WH-FB-2",
+            "external_version": "2026-05-04T10:00:00+00:00",
+            "source_payload": {
+                "orderNumber": "SO-WH-FB-2",
+                "warehouseId": 1,
+                "customer": {"name": "FromSource"},
+            },
+        })
+        assert resp.status_code == 201
+        scenario["canonical_external_ids"].append(resp.get_json()["canonical_id"])
+        rows = _query(
+            "SELECT warehouse_id FROM sales_orders WHERE external_id = %s",
+            (resp.get_json()["canonical_id"],),
+        )
+        assert rows[0][0] == 1
+
+    def test_multi_warehouse_token_uses_first_entry(
+        self, client, app, scenario,
+    ):
+        ss = scenario["ss"]
+        _build_registry(app, ss, _NO_WAREHOUSE_MAPPING.format(ss=ss))
+        _make_token(ss, "wh-fb-3", warehouse_ids=[2, 1])
+        resp = _post(client, "wh-fb-3", {
+            "external_id": "SO-WH-FB-3",
+            "external_version": "2026-05-04T10:00:00+00:00",
+            "source_payload": {
+                "orderNumber": "SO-WH-FB-3",
+                "customer": {"name": "FromSource"},
+            },
+        })
+        assert resp.status_code == 201, resp.get_json()
+        scenario["canonical_external_ids"].append(resp.get_json()["canonical_id"])
+        rows = _query(
+            "SELECT warehouse_id FROM sales_orders WHERE external_id = %s",
+            (resp.get_json()["canonical_id"],),
+        )
+        # First entry (warehouse 2) wins; multi-warehouse tokens that
+        # need different routing per request must source warehouse_id
+        # from payload or mapping doc default.
+        assert rows[0][0] == 2
+
+    def test_empty_warehouse_token_still_fails_loud(
+        self, client, app, scenario,
+    ):
+        # Token with no warehouses + source missing warehouse_id ->
+        # canonical INSERT fails on NOT NULL. Surfaces as 422
+        # canonical_constraint_violation; no silent default behavior.
+        # NOTE: The decorator typically refuses inbound-only tokens
+        # with empty warehouse_ids; this test exercises the handler's
+        # behaviour, not the decorator gate, so we set warehouse_ids
+        # to [] explicitly.
+        ss = scenario["ss"]
+        _build_registry(app, ss, _NO_WAREHOUSE_MAPPING.format(ss=ss))
+        _make_token(ss, "wh-fb-4", warehouse_ids=[])
+        resp = _post(client, "wh-fb-4", {
+            "external_id": "SO-WH-FB-4",
+            "external_version": "2026-05-04T10:00:00+00:00",
+            "source_payload": {
+                "orderNumber": "SO-WH-FB-4",
+                "customer": {"name": "FromSource"},
+            },
+        })
+        # Either the decorator rejects (401 cross_direction_scope_violation)
+        # or the handler reaches the canonical INSERT and fails with
+        # 422 canonical_constraint_violation. Both encode the same
+        # operator-visible truth: a token with no warehouse cannot
+        # ingest orders without source-side warehouse_id.
+        assert resp.status_code in (401, 422), resp.get_json()

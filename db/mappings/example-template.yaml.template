@@ -148,13 +148,19 @@ resources:
         required: true
 
       - canonical: "warehouse_id"
-        # required: true -- sales_orders.warehouse_id is NOT NULL
-        # with no default and FK-references warehouses(warehouse_id).
-        # The handler will 422 if absent or if the value does not
-        # match an existing warehouse.
+        # sales_orders.warehouse_id is NOT NULL with no default and
+        # FK-references warehouses(warehouse_id). v1.8.0 (#300) adds
+        # a token-fallback: when this field is absent / null AND the
+        # issuing token's warehouse_ids array carries at least one
+        # entry, the handler fills in token.warehouse_ids[0]. So the
+        # mapping doc can leave required: false (or omit warehouse_id
+        # entirely) when each token is scoped to one warehouse.
+        # Multi-warehouse tokens still take the first entry; tighten
+        # the mapping doc with required: true when source-side
+        # routing matters.
         source_path: "$.warehouse_id"
         type: "integer"           # accepts int or numeric string; cast to int.
-        required: true
+        required: false
 
       - canonical: "customer_id"
         # cross_system_lookup advanced feature. When the source-system
@@ -504,11 +510,16 @@ resources:
         required: true
 
       - canonical: "warehouse_id"
-        # required: true -- purchase_orders.warehouse_id is NOT NULL
-        # with no default and FK-references warehouses(warehouse_id).
+        # purchase_orders.warehouse_id is NOT NULL with no default
+        # and FK-references warehouses(warehouse_id). v1.8.0 (#300)
+        # adds a token-fallback: when this field is absent / null
+        # AND the issuing token's warehouse_ids array carries at
+        # least one entry, the handler fills in token.warehouse_ids[0].
+        # See sales_orders warehouse_id comment for the full
+        # operator-side semantics.
         source_path: "$.warehouse_id"
         type: "integer"
-        required: true
+        required: false
 
       - canonical: "vendor_id"
         # Same cross_system_lookup pattern as sales_orders.customer_id.

@@ -379,6 +379,27 @@ def handle_inbound(
         if overrides
         else document.field_set(resource_key)
     )
+
+    # v1.8.0 (#300): warehouse_id token fallback. When the resolved
+    # canonical_payload has no warehouse_id (source did not provide,
+    # mapping doc did not declare a default) AND the token's
+    # warehouse_ids array carries at least one entry, fill in the
+    # first entry. Single-warehouse tokens (the common case for a
+    # connector author who scopes a token to one site) get the
+    # natural fallback without per-mapping-doc plumbing. Multi-
+    # warehouse tokens still take the first entry; operators who
+    # need different routing per inbound POST should set warehouse_id
+    # in source or declare a mapping doc default. Only sales_orders +
+    # purchase_orders have a warehouse_id column (items / customers
+    # / vendors are warehouse-agnostic by design).
+    if (
+        cfg.canonical_table in ("sales_orders", "purchase_orders")
+        and not canonical_payload.get("warehouse_id")
+        and token.get("warehouse_ids")
+    ):
+        canonical_payload["warehouse_id"] = int(token["warehouse_ids"][0])
+        write_field_set = write_field_set | {"warehouse_id"}
+
     is_new, canonical_id = _upsert_canonical(
         db, cfg, source_system, external_id, canonical_payload,
         write_field_set,
