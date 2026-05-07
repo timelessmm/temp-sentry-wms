@@ -118,6 +118,23 @@ ACTION_WEBHOOK_SUBSCRIPTION_AUTO_PAUSE = "WEBHOOK_SUBSCRIPTION_AUTO_PAUSE"
 # not the full address.
 ACTION_SO_ADDRESS_EDITED = "SO_ADDRESS_EDITED"
 
+# v1.8.0 (#290) transfer order lifecycle. Same audit shape as the
+# cycle count adjustment surface: one row per state transition;
+# details JSONB carries the surrounding context. entity_type is 'TO'
+# for header actions, 'TO_LINE' for line actions, 'TO_APPROVAL' for
+# approval actions. The audit_log V-025 hash chain extends through
+# every TO surface so post-incident forensics can reconstruct the
+# full lifecycle.
+ACTION_TO_CREATED           = "TO_CREATED"
+ACTION_TO_LINE_PICKED       = "TO_LINE_PICKED"
+ACTION_TO_SUBMITTED         = "TO_SUBMITTED"
+ACTION_TO_APPROVED          = "TO_APPROVED"
+ACTION_TO_REJECTED          = "TO_REJECTED"
+ACTION_TO_LINE_SHORT_CLOSED = "TO_LINE_SHORT_CLOSED"
+ACTION_TO_CANCELLED         = "TO_CANCELLED"
+ACTION_TO_DELETED           = "TO_DELETED"
+ACTION_TO_CLOSED            = "TO_CLOSED"
+
 # Bin types
 BIN_STAGING = "Staging"
 BIN_PICKABLE_STAGING = "PickableStaging"
