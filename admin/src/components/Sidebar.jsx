@@ -39,7 +39,8 @@ const NAV = [
       { to: '/items', label: 'Items' },
       { to: '/preferred-bins', label: 'Preferred Bins' },
       { to: '/adjustments', label: 'Adjustments' },
-      { to: '/inter-warehouse-transfers', label: 'Transfers' },
+      { to: '/transfer-orders', label: 'Transfer Orders' },
+      { to: '/inter-warehouse-transfers', label: 'Bin Transfers' },
     ],
   },
   {
