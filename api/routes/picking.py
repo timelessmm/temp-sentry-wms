@@ -69,6 +69,21 @@ def active_batch():
         {"batch_id": batch.batch_id, "s_picked": TASK_PICKED, "s_short": TASK_SHORT},
     ).fetchone()
 
+    # v1.8.0 (#295): if any pick_tasks row carries a to_id, this is a
+    # TO batch; surface the to_number so the mobile screen can render
+    # "TO {to_number}" instead of "X orders".
+    to_row = g.db.execute(
+        text("""
+            SELECT DISTINCT pt.to_id, o.to_number
+              FROM pick_tasks pt
+              JOIN transfer_orders o ON o.to_id = pt.to_id
+             WHERE pt.batch_id = :batch_id
+             LIMIT 1
+        """),
+        {"batch_id": batch.batch_id},
+    ).fetchone()
+    kind = "TO" if to_row else "SO"
+
     return jsonify({
         "active": True,
         "batch_id": batch.batch_id,
@@ -76,6 +91,9 @@ def active_batch():
         "completed_picks": counts.completed_picks,
         "total_orders": batch.total_orders,
         "created_at": batch.created_at.isoformat() if batch.created_at else None,
+        "kind": kind,
+        "to_id": to_row.to_id if to_row else None,
+        "to_number": to_row.to_number if to_row else None,
     })
 
 

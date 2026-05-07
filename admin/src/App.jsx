@@ -31,6 +31,7 @@ import Imports from './pages/Imports.jsx';
 import Integrations from './pages/Integrations.jsx';
 import Adjustments from './pages/Adjustments.jsx';
 import InterWarehouseTransfers from './pages/InterWarehouseTransfers.jsx';
+import TransferOrders from './pages/TransferOrders.jsx';
 
 function ProtectedRoute({ children }) {
   const { user, loading } = useAuth();
@@ -80,6 +81,7 @@ export default function App() {
         <Route path="/integrations" element={<ErrorBoundary fallbackMessage="Could not load integrations."><Integrations /></ErrorBoundary>} />
         <Route path="/adjustments" element={<ErrorBoundary fallbackMessage="Could not load adjustments."><Adjustments /></ErrorBoundary>} />
         <Route path="/inter-warehouse-transfers" element={<ErrorBoundary fallbackMessage="Could not load transfers."><InterWarehouseTransfers /></ErrorBoundary>} />
+        <Route path="/transfer-orders" element={<ErrorBoundary fallbackMessage="Could not load transfer orders."><TransferOrders /></ErrorBoundary>} />
       </Route>
     </Routes>
   );

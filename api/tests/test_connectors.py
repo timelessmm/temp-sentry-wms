@@ -161,6 +161,103 @@ class TestConnectionMessageSanitization:
         assert r.message == "ok"
 
 
+class TestConnectionMessageScrubbing:
+    """v1.8.0 (#52, #53): ConnectionResult.message runs through
+    scrub_secrets at construction. Credentials in raw upstream errors
+    are redacted before the value reaches the admin UI or the
+    sync_state.last_error_message column."""
+
+    def test_url_userinfo_scrubbed(self):
+        r = ConnectionResult(
+            connected=False,
+            message="connect failed: https://alice:s3cret@erp.example.com/api",
+        )
+        assert "alice" not in r.message
+        assert "s3cret" not in r.message
+        assert "https://erp.example.com/api" in r.message
+
+    def test_bearer_token_scrubbed(self):
+        r = ConnectionResult(
+            connected=False,
+            message="401 from upstream Bearer abcdefghijklmnopqrstuvwxyz0123",
+        )
+        assert "abcdefghijklmnopqrstuvwxyz0123" not in r.message
+        assert "Bearer <REDACTED>" in r.message
+
+    def test_kv_password_scrubbed(self):
+        r = ConnectionResult(
+            connected=False,
+            message="connection rejected: password=hunter2-very-secret",
+        )
+        assert "hunter2-very-secret" not in r.message
+        assert "password=<REDACTED>" in r.message
+
+    def test_aws_access_key_scrubbed(self):
+        r = ConnectionResult(
+            connected=False,
+            message="S3 putObject denied for AKIAIOSFODNN7EXAMPLE",
+        )
+        assert "AKIAIOSFODNN7EXAMPLE" not in r.message
+        assert "AKIA<REDACTED>" in r.message
+
+    def test_jwt_scrubbed(self):
+        r = ConnectionResult(
+            connected=False,
+            message="rejected: eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.signature",
+        )
+        assert "eyJhbGciOiJIUzI1NiJ9" not in r.message
+        assert "<JWT_REDACTED>" in r.message
+
+    def test_redaction_tag_not_truncated_at_length_cap(self):
+        # Pad so the credential lands across the cap boundary; without
+        # scrub-before-truncate the redaction tag would be split.
+        from connectors.base import CONNECTION_MESSAGE_MAX_LEN
+
+        prefix = "x" * (CONNECTION_MESSAGE_MAX_LEN - 50)
+        raw = f"{prefix} api_key=ABCDEFGHIJ1234567890LMNOPQR"
+        r = ConnectionResult(connected=False, message=raw)
+        assert "ABCDEFGHIJ1234567890LMNOPQR" not in r.message
+        # Either the redaction tag survives intact, or the credential
+        # was truncated away entirely. Never a partial tag.
+        assert "<REDACT" not in r.message or "<REDACTED>" in r.message
+
+    def test_plain_message_passes_through_unchanged(self):
+        r = ConnectionResult(connected=True, message="Connected as Acme Corp")
+        assert r.message == "Connected as Acme Corp"
+
+
+class TestCarriageReturnAllowlist:
+    """v1.8.0 (#55): \\r is permitted in ConnectionResult.message so
+    Windows-origin upstream errors (which use \\r\\n line endings)
+    survive intact. Safety on emit is guaranteed by JSON encoding,
+    which escapes \\r to the two-character sequence \\\\r."""
+
+    def test_cr_preserved_in_stored_message(self):
+        r = ConnectionResult(connected=False, message="line1\r\nline2")
+        assert "\r" in r.message
+        assert "\n" in r.message
+        assert "line1" in r.message
+        assert "line2" in r.message
+
+    def test_cr_escaped_on_json_emit(self):
+        # Pydantic / json.dumps escapes the raw CR byte to "\\r" so a
+        # message that reaches the admin UI cannot inject a literal
+        # carriage return into a log line or response body.
+        r = ConnectionResult(connected=False, message="line1\r\nline2")
+        serialized = r.model_dump_json()
+        assert "\\r" in serialized
+        assert "\\n" in serialized
+        # Raw CR/LF must not appear unescaped in the JSON payload.
+        assert "\r" not in serialized
+        assert "\n" not in serialized
+
+    def test_lone_cr_preserved(self):
+        # Mac-classic line endings or progress-bar-style overwrites:
+        # the byte survives storage; emit is safe by JSON escaping.
+        r = ConnectionResult(connected=True, message="loaded\rdone")
+        assert "\r" in r.message
+
+
 # ---------------------------------------------------------------------------
 # Registration
 # ---------------------------------------------------------------------------

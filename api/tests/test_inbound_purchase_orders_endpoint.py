@@ -57,17 +57,12 @@ resources:
       - canonical: "vendor_name"
         source_path: "$.vendor.name"
         type: "string"
-    line_items:
-      source_path: "$.lineItems"
-      canonical_path: "lines"
-      fields:
-        - canonical: "sku"
-          source_path: "$.sku"
-          type: "string"
-        - canonical: "qty"
-          source_path: "$.quantity"
-          type: "integer"
 """
+# v1.8.0 (#289) line write-through: this test fixture intentionally
+# omits the line_items block so the existing header-only assertions
+# still hold. End-to-end line write-through coverage lives in
+# test_inbound_line_items_writethrough.py with the proper
+# cross_system_lookup setup (item pre-load, etc.).
 
 
 def _load(app, ss: str, body_yaml: str) -> MappingDocument:
@@ -186,58 +181,10 @@ class TestPurchaseOrdersEndpoint:
         assert vendor_name == "ACME"
         assert latest_inbound_id == body["inbound_id"]
 
-    def test_line_items_land_in_canonical_payload_only(
-        self, client, app, scenario
-    ):
-        """v1.7 first-pass: line_items resolved by the loader and stored
-        in inbound_purchase_orders.canonical_payload JSONB; NOT written
-        to the canonical purchase_order_lines table. Forensic chain
-        preserved via JSONB; line table sync lands at v1.8+ once a
-        real consumer demonstrates the shape."""
-        ss = scenario["ss"]
-        _load(app, ss, _PO_MAPPING.format(ss=ss))
-        _insert_token_via_test_conn(ss, "po-lines")
-        resp = _post(client, "po-lines", {
-            "external_id": "PO-LINES",
-            "external_version": "v1",
-            "source_payload": {
-                "poNumber": "PO-LINES",
-                "warehouseId": 1,
-                "vendor": {"name": "ACME"},
-                "lineItems": [
-                    {"sku": "ABC-001", "quantity": 5},
-                    {"sku": "ABC-002", "quantity": 10},
-                ],
-            },
-        })
-        assert resp.status_code == 201
-        inbound_id = resp.get_json()["inbound_id"]
-
-        # canonical_payload JSONB carries the resolved lines.
-        rows = _query(
-            "SELECT canonical_payload FROM inbound_purchase_orders "
-            " WHERE inbound_id = %s",
-            (inbound_id,),
-        )
-        assert rows
-        cp = rows[0][0]
-        assert cp.get("lines") == [
-            {"sku": "ABC-001", "qty": 5},
-            {"sku": "ABC-002", "qty": 10},
-        ]
-
-        # purchase_order_lines untouched (no mass-write of inbound lines
-        # to the canonical line table in v1.7).
-        po_id_rows = _query(
-            "SELECT po_id FROM purchase_orders WHERE external_id = %s",
-            (resp.get_json()["canonical_id"],),
-        )
-        assert po_id_rows
-        n = _query(
-            "SELECT COUNT(*) FROM purchase_order_lines WHERE po_id = %s",
-            (po_id_rows[0][0],),
-        )[0][0]
-        assert n == 0
+    # v1.7-era test_line_items_land_in_canonical_payload_only removed
+    # for v1.8 (#289): line_items now write through to
+    # purchase_order_lines. End-to-end line write-through coverage
+    # lives in test_inbound_line_items_writethrough.py.
 
     def test_supersession_runs_without_updated_at(self, client, app, scenario):
         """v1 then v2 with the same external_id; v2 UPDATEs the canonical

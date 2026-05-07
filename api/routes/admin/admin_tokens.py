@@ -20,6 +20,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from flask import g, jsonify, request
+from psycopg2.extras import Json
 from sqlalchemy import text
 
 from constants import (
@@ -52,6 +53,51 @@ _KNOWN_EVENT_TYPES = {entry[0] for entry in V150_CATALOG}
 # server returns so no code dupes the boundary values.
 _RECOMMENDED_DAYS = 75
 _OVERDUE_DAYS = 90
+
+
+# v1.8.0 (#270): inbound resource keys are also the canonical table
+# names; the admin endpoint validates that every mapping_overrides key
+# is a column on at least one of the token's inbound_resources tables.
+_INBOUND_RESOURCE_TO_TABLE = {
+    "sales_orders":    "sales_orders",
+    "items":           "items",
+    "customers":       "customers",
+    "vendors":         "vendors",
+    "purchase_orders": "purchase_orders",
+}
+
+
+def _validate_override_keys_against_canonical(
+    db, inbound_resources: list, override_keys: list
+) -> Optional[list]:
+    """Return a sorted list of override keys that are NOT columns on
+    any of the token's inbound_resources canonical tables, or None when
+    every key resolves. Empty input returns None.
+
+    The boot canonical-column validator (#267) covers mapping doc field
+    names; this helper covers token-level override keys at issuance
+    time so an operator typo surfaces as 422 rather than as a silent
+    no-op at first inbound POST.
+    """
+    if not override_keys:
+        return None
+    tables = sorted(
+        {_INBOUND_RESOURCE_TO_TABLE[r] for r in inbound_resources
+         if r in _INBOUND_RESOURCE_TO_TABLE}
+    )
+    if not tables:
+        return sorted(override_keys)
+    rows = db.execute(
+        text(
+            "SELECT column_name FROM information_schema.columns "
+            " WHERE table_schema = 'public' "
+            "   AND table_name = ANY(:tables)"
+        ),
+        {"tables": tables},
+    ).fetchall()
+    valid_columns = {r[0] for r in rows}
+    unknown = sorted(k for k in override_keys if k not in valid_columns)
+    return unknown or None
 
 
 def _hash_for_storage(plaintext: str) -> str:
@@ -100,6 +146,13 @@ def _row_to_listing(row) -> dict:
             else []
         ),
         "mapping_override": bool(getattr(row, "mapping_override", False)),
+        # v1.8.0 (#270): expose only the override keys to the admin UI,
+        # never the values. Operators inspect the JSONB body via
+        # SELECT or the dedicated admin endpoint (added with the
+        # JSONB editor follow-up).
+        "mapping_overrides_keys": sorted(
+            (getattr(row, "mapping_overrides", None) or {}).keys()
+        ),
     }
 
 
@@ -246,18 +299,43 @@ def create_token(validated):
                 400,
             )
 
+    # v1.8.0 (#270): canonical-field-name allowlist for mapping_overrides
+    # keys. Schema-level shape was checked in CreateTokenRequest;
+    # information_schema lookup happens here.
+    override_keys = sorted(validated.mapping_overrides.keys())
+    unknown_keys = _validate_override_keys_against_canonical(
+        g.db, list(validated.inbound_resources), override_keys
+    )
+    if unknown_keys:
+        return (
+            jsonify(
+                {
+                    "error": "unknown_mapping_overrides_keys",
+                    "unknown_keys": unknown_keys,
+                    "detail": (
+                        "mapping_overrides keys must be columns on the "
+                        "canonical table(s) for the token's "
+                        "inbound_resources."
+                    ),
+                }
+            ),
+            422,
+        )
+
     plaintext = secrets.token_urlsafe(32)
     token_hash = _hash_for_storage(plaintext)
 
     base_cols = (
         "token_name, token_hash, "
         "warehouse_ids, event_types, endpoints, connector_id, "
-        "source_system, inbound_resources, mapping_override"
+        "source_system, inbound_resources, mapping_override, "
+        "mapping_overrides"
     )
     base_vals = (
         ":name, :hash, "
         ":wh_ids, :ev_types, :endpoints, :connector_id, "
-        ":source_system, :inbound_resources, :mapping_override"
+        ":source_system, :inbound_resources, :mapping_override, "
+        ":mapping_overrides"
     )
     base_params = {
         "name": validated.token_name,
@@ -269,6 +347,7 @@ def create_token(validated):
         "source_system": validated.source_system,
         "inbound_resources": validated.inbound_resources,
         "mapping_override": validated.mapping_override,
+        "mapping_overrides": Json(validated.mapping_overrides),
     }
     if validated.expires_at is not None:
         result = g.db.execute(
@@ -309,6 +388,13 @@ def create_token(validated):
             "source_system": validated.source_system,
             "inbound_resources": list(validated.inbound_resources),
             "mapping_override": validated.mapping_override,
+            # v1.8.0 (#270): record only the override keys, never the
+            # values. Values may include defaults that look credential-
+            # shaped to a log scraper; field names + the live wms_tokens
+            # row are sufficient for reconstruction. Always emit the
+            # field (empty list when no overrides) so audit shape is
+            # uniform across history going forward.
+            "mapping_overrides_keys": override_keys,
             "expires_at": row.expires_at.isoformat() if row.expires_at else None,
         },
     )
@@ -341,7 +427,8 @@ def list_tokens():
             SELECT token_id, token_name, warehouse_ids, event_types, endpoints,
                    connector_id, status, created_at, rotated_at, expires_at,
                    revoked_at, last_used_at,
-                   source_system, inbound_resources, mapping_override
+                   source_system, inbound_resources, mapping_override,
+                   mapping_overrides
               FROM wms_tokens
              ORDER BY created_at DESC
             """
@@ -358,8 +445,9 @@ def rotate_token(token_id):
     """Issue a new plaintext, replace the hash, bump rotated_at. Plaintext once."""
     existing = g.db.execute(
         text(
-            "SELECT token_id, token_name, status FROM wms_tokens "
-            "WHERE token_id = :tid FOR UPDATE"
+            "SELECT token_id, token_name, status, mapping_overrides "
+            "  FROM wms_tokens "
+            " WHERE token_id = :tid FOR UPDATE"
         ),
         {"tid": token_id},
     ).fetchone()
@@ -392,7 +480,15 @@ def rotate_token(token_id):
         entity_id=token_id,
         user_id=g.current_user["username"],
         warehouse_id=None,
-        details={"token_name": existing.token_name},
+        details={
+            "token_name": existing.token_name,
+            # v1.8.0 (#270): rotation does not change scope, but the
+            # audit shape stays uniform with TOKEN_ISSUE so investigators
+            # can scan a single shape across both action types.
+            "mapping_overrides_keys": sorted(
+                (existing.mapping_overrides or {}).keys()
+            ),
+        },
     )
     g.db.commit()
 
@@ -474,7 +570,8 @@ def delete_token(token_id):
             "DELETE FROM wms_tokens WHERE token_id = :tid "
             "RETURNING token_id, token_name, warehouse_ids, event_types, "
             "endpoints, connector_id, status, "
-            "source_system, inbound_resources, mapping_override"
+            "source_system, inbound_resources, mapping_override, "
+            "mapping_overrides"
         ),
         {"tid": token_id},
     ).fetchone()
@@ -502,6 +599,12 @@ def delete_token(token_id):
                     else []
                 ),
                 "mapping_override": bool(result.mapping_override),
+                # v1.8.0 (#270): keys only, never values. Live JSONB
+                # disappears with the row; the audit row preserves the
+                # field-name footprint of the deleted token.
+                "mapping_overrides_keys": sorted(
+                    (result.mapping_overrides or {}).keys()
+                ),
             },
         },
     )

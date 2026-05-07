@@ -1,9 +1,9 @@
 """Pydantic schemas for /api/admin/tokens (v1.5.0 #129, v1.5.1 #140, v1.7.0 Pipe B)."""
 
 from datetime import datetime
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from middleware.auth_middleware import (
     V150_ENDPOINT_SLUGS,
@@ -15,6 +15,8 @@ _INBOUND_RESOURCE_KEYS = frozenset(V170_INBOUND_RESOURCE_BY_ENDPOINT.values())
 
 
 class CreateTokenRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     token_name: str = Field(..., min_length=1, max_length=128)
     warehouse_ids: List[int] = Field(default_factory=list)
     event_types: List[str] = Field(default_factory=list, max_length=64)
@@ -33,6 +35,14 @@ class CreateTokenRequest(BaseModel):
     source_system: Optional[str] = Field(None, max_length=64)
     inbound_resources: List[str] = Field(default_factory=list, max_length=16)
     mapping_override: bool = False
+    # v1.8.0 (#270): per-token static override map. Keys are canonical
+    # field names; values are the values to write (replacing any
+    # source-derived value) at apply time. Only consulted when
+    # mapping_override is also True. Canonical-field-name allowlist
+    # validation happens at the admin route level (needs DB access for
+    # information_schema.columns lookup) -- this schema only enforces
+    # shape + size + the capability-flag pairing rule.
+    mapping_overrides: Dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("endpoints")
     @classmethod
@@ -81,6 +91,30 @@ class CreateTokenRequest(BaseModel):
                 "mapping_override capability only applies to inbound "
                 "tokens; set inbound_resources or clear mapping_override."
             )
+        # v1.8.0 (#270): non-empty mapping_overrides requires the
+        # capability flag. The handler only consults the JSONB when
+        # the flag is True; rejecting the half-configured shape at
+        # admin time prevents a silent no-op token where the operator
+        # set overrides but forgot the gate.
+        if self.mapping_overrides and not self.mapping_override:
+            raise ValueError(
+                "mapping_overrides requires mapping_override=true; the "
+                "inbound handler ignores the JSONB unless the capability "
+                "flag is set."
+            )
+        # Reject keys that are obviously not canonical field names.
+        # The deeper "must be a column on a token-resource canonical
+        # table" check lives at the admin route (needs DB access).
+        for key in self.mapping_overrides:
+            if not isinstance(key, str) or not key:
+                raise ValueError(
+                    f"mapping_overrides key {key!r} must be a non-empty string"
+                )
+            if not key.replace("_", "").isalnum():
+                raise ValueError(
+                    f"mapping_overrides key {key!r} must be alphanumeric "
+                    "with underscores (canonical-field-name shape)"
+                )
         return self
 
 

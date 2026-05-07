@@ -111,6 +111,30 @@ ACTION_WEBHOOK_DELIVERY_REPLAY_BATCH = "WEBHOOK_DELIVERY_REPLAY_BATCH"
 # the bad column in audit_log without grepping daemon logs.
 ACTION_WEBHOOK_SUBSCRIPTION_AUTO_PAUSE = "WEBHOOK_SUBSCRIPTION_AUTO_PAUSE"
 
+# v1.8.0 (#288) sales_order address edits. One audit row per edited
+# field carrying {field_changed, old_value, new_value} in details so
+# investigators can reconstruct who changed what without scanning the
+# 16-column row diff. PII-careful: only changed fields are recorded,
+# not the full address.
+ACTION_SO_ADDRESS_EDITED = "SO_ADDRESS_EDITED"
+
+# v1.8.0 (#290) transfer order lifecycle. Same audit shape as the
+# cycle count adjustment surface: one row per state transition;
+# details JSONB carries the surrounding context. entity_type is 'TO'
+# for header actions, 'TO_LINE' for line actions, 'TO_APPROVAL' for
+# approval actions. The audit_log V-025 hash chain extends through
+# every TO surface so post-incident forensics can reconstruct the
+# full lifecycle.
+ACTION_TO_CREATED           = "TO_CREATED"
+ACTION_TO_LINE_PICKED       = "TO_LINE_PICKED"
+ACTION_TO_SUBMITTED         = "TO_SUBMITTED"
+ACTION_TO_APPROVED          = "TO_APPROVED"
+ACTION_TO_REJECTED          = "TO_REJECTED"
+ACTION_TO_LINE_SHORT_CLOSED = "TO_LINE_SHORT_CLOSED"
+ACTION_TO_CANCELLED         = "TO_CANCELLED"
+ACTION_TO_DELETED           = "TO_DELETED"
+ACTION_TO_CLOSED            = "TO_CLOSED"
+
 # Bin types
 BIN_STAGING = "Staging"
 BIN_PICKABLE_STAGING = "PickableStaging"

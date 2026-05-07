@@ -233,6 +233,23 @@ def get_batch_tasks(db, batch_id):
 
     tasks = _get_tasks_for_batch(db, batch_id)
 
+    # v1.8.0 (#295): TO batch detection. pick_batch_orders is empty for
+    # a TO batch (no SO joins); the TO header surfaces via pick_tasks
+    # discriminator -> transfer_orders.
+    to_row = db.execute(
+        text(
+            """
+            SELECT DISTINCT pt.to_id, o.to_number
+              FROM pick_tasks pt
+              JOIN transfer_orders o ON o.to_id = pt.to_id
+             WHERE pt.batch_id = :bid
+             LIMIT 1
+            """
+        ),
+        {"bid": batch_id},
+    ).fetchone()
+    kind = "TO" if to_row else "SO"
+
     return {
         "batch_id": batch.batch_id,
         "batch_number": batch.batch_number,
@@ -241,10 +258,16 @@ def get_batch_tasks(db, batch_id):
         "total_items": batch.total_items,
         "orders": [{"so_number": o.so_number, "tote_number": o.tote_number} for o in orders],
         "tasks": tasks,
+        "kind": kind,
+        "to_id": to_row.to_id if to_row else None,
+        "to_number": to_row.to_number if to_row else None,
     }
 
 
 def get_next_task(db, batch_id):
+    # v1.8.0 (#295): LEFT JOIN sales_orders + transfer_orders so the
+    # row resolves regardless of the pick_tasks discriminator. so_number
+    # is NULL for TO tasks; to_number is NULL for SO tasks.
     row = db.execute(
         text(
             """
@@ -253,12 +276,14 @@ def get_next_task(db, batch_id):
                    b.bin_code, b.bin_barcode, b.aisle, b.row_num, b.level_num,
                    i.sku, i.item_name, i.upc,
                    so.so_number,
+                   tro.to_number,
                    z.zone_name
             FROM pick_tasks pt
             JOIN bins b ON b.bin_id = pt.bin_id
             LEFT JOIN zones z ON z.zone_id = b.zone_id
             JOIN items i ON i.item_id = pt.item_id
-            JOIN sales_orders so ON so.so_id = pt.so_id
+            LEFT JOIN sales_orders so ON so.so_id = pt.so_id
+            LEFT JOIN transfer_orders tro ON tro.to_id = pt.to_id
             WHERE pt.batch_id = :bid AND pt.status = :task_pending
             ORDER BY pt.pick_sequence ASC
             LIMIT 1
@@ -300,8 +325,10 @@ def confirm_pick(db, pick_task_id, scanned_barcode, quantity_picked, username):
     task = db.execute(
         text(
             """
-            SELECT pt.pick_task_id, pt.batch_id, pt.so_id, pt.so_line_id, pt.item_id,
-                   pt.bin_id, pt.quantity_to_pick, pt.status, pt.tote_number
+            SELECT pt.pick_task_id, pt.batch_id, pt.so_id, pt.so_line_id,
+                   pt.to_id, pt.to_line_id,
+                   pt.item_id, pt.bin_id, pt.quantity_to_pick, pt.status,
+                   pt.tote_number
             FROM pick_tasks pt
             WHERE pt.pick_task_id = :tid
             """
@@ -342,49 +369,79 @@ def confirm_pick(db, pick_task_id, scanned_barcode, quantity_picked, username):
         {"qty": quantity_picked, "user": username, "tid": pick_task_id, "task_status": TASK_PICKED},
     )
 
-    # 4. Update sales_order_lines.quantity_picked (wave or standard)
-    breakdown = db.execute(
-        text("SELECT id, so_id, so_line_id, quantity FROM wave_pick_breakdown WHERE pick_task_id = :tid ORDER BY so_id"),
-        {"tid": pick_task_id},
-    ).fetchall()
+    # 4. Branch on the pick_tasks discriminator (mig 049 #281). SO
+    # picks update sales_order_lines as before; TO picks update
+    # transfer_order_lines via the picked-state-machine helper. The
+    # XOR CHECK on pick_tasks guarantees exactly one of so_id / to_id
+    # is non-NULL so the branches are mutually exclusive.
+    if task.to_id is not None:
+        # v1.8.0 (#292): TO line picked-qty + status update via the
+        # WHERE-clause guard helper. Raises OverPickAttempt when a
+        # concurrent picker has already filled the line; the route
+        # surfaces 409.
+        from services.transfer_order_service import (
+            maybe_promote_header_to_partially_picked,
+            update_transfer_order_line_picked,
+        )
+        update_transfer_order_line_picked(
+            db, task.to_line_id, quantity_picked,
+        )
+        maybe_promote_header_to_partially_picked(db, task.to_id)
+    else:
+        breakdown = db.execute(
+            text("SELECT id, so_id, so_line_id, quantity FROM wave_pick_breakdown WHERE pick_task_id = :tid ORDER BY so_id"),
+            {"tid": pick_task_id},
+        ).fetchall()
 
-    if breakdown:
-        # Wave pick - update each contributing SO line
-        for bd in breakdown:
-            db.execute(
-                text(
-                    "UPDATE wave_pick_breakdown SET quantity_picked = quantity WHERE id = :bid"
-                ),
-                {"bid": bd.id},
-            )
+        if breakdown:
+            # Wave pick - update each contributing SO line
+            for bd in breakdown:
+                db.execute(
+                    text(
+                        "UPDATE wave_pick_breakdown SET quantity_picked = quantity WHERE id = :bid"
+                    ),
+                    {"bid": bd.id},
+                )
+                db.execute(
+                    text(
+                        "UPDATE sales_order_lines SET quantity_picked = quantity_picked + :qty WHERE so_line_id = :sol_id"
+                    ),
+                    {"qty": bd.quantity, "sol_id": bd.so_line_id},
+                )
+        else:
+            # Standard pick - single SO line
             db.execute(
                 text(
                     "UPDATE sales_order_lines SET quantity_picked = quantity_picked + :qty WHERE so_line_id = :sol_id"
                 ),
-                {"qty": bd.quantity, "sol_id": bd.so_line_id},
+                {"qty": quantity_picked, "sol_id": task.so_line_id},
             )
-    else:
-        # Standard pick - single SO line
+
+    # 5. Update inventory (floor at zero for safety).
+    #
+    # SO picks decrement source on_hand + allocated immediately: the
+    # picked stock is committed to the SO and not returnable through
+    # the SO flow.
+    #
+    # TO picks v1.8.0 (#293): inventory does NOT change at pick time.
+    # The TO reservation (quantity_allocated, set at import) persists
+    # through pick + submit; inventory moves source -> destination
+    # only when an admin approves the picker's submission. A
+    # rejection therefore leaves source stock intact for re-pick;
+    # short-close on the line is the operator-side closeout.
+    if task.to_id is None:
         db.execute(
             text(
-                "UPDATE sales_order_lines SET quantity_picked = quantity_picked + :qty WHERE so_line_id = :sol_id"
+                """
+                UPDATE inventory
+                SET quantity_on_hand = GREATEST(0, quantity_on_hand - :picked),
+                    quantity_allocated = GREATEST(0, quantity_allocated - :allocated),
+                    updated_at = NOW()
+                WHERE item_id = :iid AND bin_id = :bid
+                """
             ),
-            {"qty": quantity_picked, "sol_id": task.so_line_id},
+            {"picked": quantity_picked, "allocated": task.quantity_to_pick, "iid": task.item_id, "bid": task.bin_id},
         )
-
-    # 5. Update inventory (floor at zero for safety)
-    db.execute(
-        text(
-            """
-            UPDATE inventory
-            SET quantity_on_hand = GREATEST(0, quantity_on_hand - :picked),
-                quantity_allocated = GREATEST(0, quantity_allocated - :allocated),
-                updated_at = NOW()
-            WHERE item_id = :iid AND bin_id = :bid
-            """
-        ),
-        {"picked": quantity_picked, "allocated": task.quantity_to_pick, "iid": task.item_id, "bid": task.bin_id},
-    )
 
     # 6. Get remaining count
     remaining = db.execute(
@@ -398,22 +455,45 @@ def confirm_pick(db, pick_task_id, scanned_barcode, quantity_picked, username):
         {"bid": task.batch_id},
     ).fetchone()
 
-    write_audit_log(
-        db,
-        action_type=ACTION_PICK,
-        entity_type="SO",
-        entity_id=task.so_id,
-        user_id=username,
-        warehouse_id=batch.warehouse_id,
-        details={
-            "pick_task_id": pick_task_id,
-            "item_id": task.item_id,
-            "sku": item.sku,
-            "quantity_picked": quantity_picked,
-            "bin_id": task.bin_id,
-            "batch_id": task.batch_id,
-        },
-    )
+    if task.to_id is not None:
+        # v1.8.0 (#292): TO picks log against TO_LINE entity so
+        # investigators trace back through the TO lifecycle audit
+        # chain rather than mixing with SO picks.
+        from constants import ACTION_TO_LINE_PICKED
+        write_audit_log(
+            db,
+            action_type=ACTION_TO_LINE_PICKED,
+            entity_type="TO_LINE",
+            entity_id=task.to_line_id,
+            user_id=username,
+            warehouse_id=batch.warehouse_id,
+            details={
+                "pick_task_id": pick_task_id,
+                "to_id": task.to_id,
+                "item_id": task.item_id,
+                "sku": item.sku,
+                "quantity_picked": quantity_picked,
+                "bin_id": task.bin_id,
+                "batch_id": task.batch_id,
+            },
+        )
+    else:
+        write_audit_log(
+            db,
+            action_type=ACTION_PICK,
+            entity_type="SO",
+            entity_id=task.so_id,
+            user_id=username,
+            warehouse_id=batch.warehouse_id,
+            details={
+                "pick_task_id": pick_task_id,
+                "item_id": task.item_id,
+                "sku": item.sku,
+                "quantity_picked": quantity_picked,
+                "bin_id": task.bin_id,
+                "batch_id": task.batch_id,
+            },
+        )
 
     db.commit()
 
@@ -1111,6 +1191,9 @@ def _get_contributing_orders(db, pick_task_id):
 
 
 def _get_tasks_for_batch(db, batch_id):
+    # v1.8.0 (#295): LEFT JOIN sales_orders + transfer_orders so TO
+    # tasks resolve too; so_number is NULL for TO rows and to_number
+    # is NULL for SO rows.
     rows = db.execute(
         text(
             """
@@ -1119,12 +1202,14 @@ def _get_tasks_for_batch(db, batch_id):
                    b.bin_code, b.bin_barcode, b.aisle, b.row_num, b.level_num,
                    i.sku, i.item_name, i.upc,
                    so.so_number,
+                   tro.to_number,
                    z.zone_name
             FROM pick_tasks pt
             JOIN bins b ON b.bin_id = pt.bin_id
             LEFT JOIN zones z ON z.zone_id = b.zone_id
             JOIN items i ON i.item_id = pt.item_id
-            JOIN sales_orders so ON so.so_id = pt.so_id
+            LEFT JOIN sales_orders so ON so.so_id = pt.so_id
+            LEFT JOIN transfer_orders tro ON tro.to_id = pt.to_id
             WHERE pt.batch_id = :bid
             ORDER BY pt.pick_sequence ASC, b.bin_code ASC
             """
@@ -1151,6 +1236,10 @@ def _task_row_to_dict(row):
         "quantity_to_pick": row.quantity_to_pick,
         "tote_number": row.tote_number,
         "so_number": row.so_number,
+        # v1.8.0 (#295): TO discriminator. NULL when this row is a
+        # SO pick (so_number set instead). Mobile renders the
+        # appropriate header based on whichever is non-null.
+        "to_number": getattr(row, "to_number", None),
         "status": row.status,
     }
 

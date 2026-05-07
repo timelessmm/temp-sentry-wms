@@ -20,7 +20,12 @@ CREATE TABLE warehouses (
     warehouse_name VARCHAR(100) NOT NULL,
     address VARCHAR(500),
     is_active BOOLEAN DEFAULT TRUE,
-    created_at TIMESTAMPTZ DEFAULT NOW()
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    -- v1.8.0 (#283): productivity dashboard "Today" / "Yesterday"
+    -- range maps to warehouse-local, not UTC. Default matches the
+    -- AvidMax baseline; per-warehouse override is operator-managed
+    -- in v1.8 (no admin UI in this release).
+    timezone VARCHAR(64) NOT NULL DEFAULT 'America/Denver'
 );
 
 CREATE TABLE zones (
@@ -185,12 +190,34 @@ CREATE TABLE sales_orders (
     warehouse_id INT NOT NULL REFERENCES warehouses(warehouse_id),
     ship_method VARCHAR(50),
     ship_address VARCHAR(500),
-    -- v1.7.0 (#266): per-order ecommerce ship-to / bill-to. ship_address
-    -- above stays the warehouse-floor field used by pick/pack/ship;
-    -- shipping_address + billing_address are the canonical values
-    -- inbound consumers populate (per-order, not per-customer).
-    billing_address TEXT,
-    shipping_address TEXT,
+    -- v1.8.0 (#288): per-order ecommerce ship-to / bill-to with each
+    -- address component in its own column so operators (and the inbound
+    -- mapping docs) can address them independently. Replaces the v1.7
+    -- mig 046 billing_address / shipping_address TEXT placeholders.
+    -- ship_address above stays the warehouse-floor field used by
+    -- pick/pack/ship.
+    billing_address_name        VARCHAR(200),
+    billing_address_line1       VARCHAR(200),
+    billing_address_line2       VARCHAR(200),
+    billing_address_city        VARCHAR(100),
+    billing_address_state       VARCHAR(100),
+    billing_address_postal_code VARCHAR(32),
+    billing_address_country     VARCHAR(64),
+    billing_address_phone       VARCHAR(64),
+    shipping_address_name        VARCHAR(200),
+    shipping_address_line1       VARCHAR(200),
+    shipping_address_line2       VARCHAR(200),
+    shipping_address_city        VARCHAR(100),
+    shipping_address_state       VARCHAR(100),
+    shipping_address_postal_code VARCHAR(32),
+    shipping_address_country     VARCHAR(64),
+    shipping_address_phone       VARCHAR(64),
+    -- v1.8.0 (#282): values from the source ERP. Currency implied per
+    -- Sentry instance (no per-order currency in v1.8). Wire-level
+    -- range / precision validation lives in the Pydantic inbound
+    -- schema; the column itself is permissive.
+    order_total            NUMERIC(12,2),
+    customer_shipping_paid NUMERIC(12,2),
     order_date TIMESTAMPTZ,
     ship_by_date DATE,
     created_at TIMESTAMPTZ DEFAULT NOW(),
@@ -413,6 +440,13 @@ CREATE TABLE audit_log (
 
 CREATE INDEX ix_audit_log_action ON audit_log(action_type, created_at);
 CREATE INDEX ix_audit_log_entity ON audit_log(entity_type, entity_id);
+-- v1.8.0 (#283): productivity dashboard aggregation. Pattern is
+-- WHERE created_at BETWEEN :s AND :e AND action_type = ANY(:actions)
+-- AND warehouse_id = :w GROUP BY user_id, action_type. INCLUDE clause
+-- covers the projection for index-only scans.
+CREATE INDEX ix_audit_log_dashboard
+    ON audit_log(action_type, created_at, user_id, warehouse_id)
+    INCLUDE (entity_id, details);
 
 -- V-025 tamper resistance: hash-chain trigger + append-only guards.
 -- The identical DDL lives in db/migrations/016_audit_log_tamper_resistance.sql
@@ -811,10 +845,15 @@ CREATE TRIGGER tr_inbound_source_systems_allowlist_audit_truncate
 --                        purchase_orders).
 --   mapping_override  -- BOOLEAN capability flag for per-request mapping
 --                        overrides; default false.
+--   mapping_overrides -- JSONB per-token static override map (v1.8.0
+--                        #284, mig 052). Consulted only when
+--                        mapping_override is TRUE.
 --
 -- The identical DDL lives in db/migrations/023_wms_tokens.sql for
 -- deployments created before v1.5.0; the v1.7 columns are added by
--- db/migrations/037_wms_tokens_inbound_columns.sql.
+-- db/migrations/037_wms_tokens_inbound_columns.sql; the v1.8
+-- mapping_overrides JSONB is added by
+-- db/migrations/052_mapping_override_per_token.sql.
 -- ============================================================
 
 CREATE TABLE wms_tokens (
@@ -828,6 +867,7 @@ CREATE TABLE wms_tokens (
     source_system     VARCHAR(64)   REFERENCES inbound_source_systems_allowlist(source_system),
     inbound_resources TEXT[]        NOT NULL DEFAULT '{}',
     mapping_override  BOOLEAN       NOT NULL DEFAULT FALSE,
+    mapping_overrides JSONB         NOT NULL DEFAULT '{}'::jsonb,
     status            VARCHAR(16)   NOT NULL DEFAULT 'active',
     created_at        TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
     rotated_at        TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
@@ -1716,3 +1756,112 @@ CREATE TABLE webhook_subscriptions_tombstones (
 CREATE INDEX webhook_subscriptions_tombstones_canonical_unack
     ON webhook_subscriptions_tombstones (delivery_url_canonical)
     WHERE acknowledged_at IS NULL;
+
+-- ============================================================
+-- TRANSFER ORDERS (v1.8.0 #281)
+-- ============================================================
+-- Warehouse-to-warehouse inventory transfers. Identical DDL lives
+-- in db/migrations/049_transfer_orders.sql. pick_tasks gains a
+-- to_id / to_line_id discriminator with an XOR CHECK so the
+-- existing picking module dispatches on whether a row points at
+-- a SO line or a TO line.
+
+CREATE TABLE transfer_orders (
+    to_id                     SERIAL PRIMARY KEY,
+    to_number                 VARCHAR(32) NOT NULL UNIQUE,
+    source_warehouse_id       INT NOT NULL REFERENCES warehouses(warehouse_id),
+    destination_warehouse_id  INT NOT NULL REFERENCES warehouses(warehouse_id),
+    status                    VARCHAR(24) NOT NULL DEFAULT 'OPEN'
+                                CHECK (status IN ('OPEN','PARTIALLY_PICKED','AWAITING_APPROVAL','APPROVED','CLOSED','CANCELLED')),
+    created_by                VARCHAR(100) NOT NULL,
+    notes                     TEXT,
+    external_id               UUID NOT NULL UNIQUE,
+    created_at                TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at                TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT transfer_orders_warehouses_distinct
+        CHECK (source_warehouse_id <> destination_warehouse_id)
+);
+
+CREATE INDEX ix_transfer_orders_source ON transfer_orders(source_warehouse_id, status);
+CREATE INDEX ix_transfer_orders_dest   ON transfer_orders(destination_warehouse_id, status);
+CREATE INDEX ix_transfer_orders_status ON transfer_orders(status, created_at);
+
+CREATE TABLE transfer_order_lines (
+    to_line_id      SERIAL PRIMARY KEY,
+    to_id           INT NOT NULL REFERENCES transfer_orders(to_id) ON DELETE CASCADE,
+    item_id         INT NOT NULL REFERENCES items(item_id),
+    line_number     INT NOT NULL,
+    requested_qty   INT NOT NULL CHECK (requested_qty > 0),
+    committed_qty   INT NOT NULL DEFAULT 0 CHECK (committed_qty >= 0),
+    picked_qty      INT NOT NULL DEFAULT 0 CHECK (picked_qty >= 0),
+    approved_qty    INT NOT NULL DEFAULT 0 CHECK (approved_qty >= 0),
+    status          VARCHAR(24) NOT NULL DEFAULT 'PENDING'
+                      CHECK (status IN ('PENDING','PARTIALLY_PICKED','PICKED','APPROVED','SHORT_CLOSED')),
+    UNIQUE (to_id, line_number),
+    CHECK (committed_qty <= requested_qty),
+    CHECK (picked_qty <= committed_qty),
+    CHECK (approved_qty <= picked_qty)
+);
+
+CREATE INDEX ix_transfer_order_lines_to   ON transfer_order_lines(to_id);
+CREATE INDEX ix_transfer_order_lines_item ON transfer_order_lines(item_id);
+
+CREATE TABLE transfer_order_approvals (
+    to_approval_id    SERIAL PRIMARY KEY,
+    to_id             INT NOT NULL REFERENCES transfer_orders(to_id) ON DELETE CASCADE,
+    submitted_by      VARCHAR(100) NOT NULL,
+    submitted_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    approved_by       VARCHAR(100),
+    approved_at       TIMESTAMPTZ,
+    rejected_at       TIMESTAMPTZ,
+    rejection_reason  TEXT,
+    lines_snapshot    JSONB NOT NULL,
+    status            VARCHAR(16) NOT NULL DEFAULT 'PENDING'
+                        CHECK (status IN ('PENDING','APPROVED','REJECTED')),
+    external_id       UUID NOT NULL UNIQUE,
+    CHECK ((status = 'APPROVED' AND approved_at IS NOT NULL)
+        OR (status = 'REJECTED' AND rejected_at IS NOT NULL)
+        OR (status = 'PENDING'))
+);
+
+CREATE INDEX ix_to_approvals_to ON transfer_order_approvals(to_id);
+CREATE INDEX ix_to_approvals_pending ON transfer_order_approvals(status, submitted_at)
+    WHERE status = 'PENDING';
+
+ALTER TABLE pick_tasks
+    ALTER COLUMN so_id DROP NOT NULL,
+    ALTER COLUMN so_line_id DROP NOT NULL;
+
+ALTER TABLE pick_tasks
+    ADD COLUMN to_id      INT REFERENCES transfer_orders(to_id),
+    ADD COLUMN to_line_id INT REFERENCES transfer_order_lines(to_line_id);
+
+CREATE INDEX ix_pick_tasks_to      ON pick_tasks(to_id);
+CREATE INDEX ix_pick_tasks_to_line ON pick_tasks(to_line_id);
+
+ALTER TABLE pick_tasks
+    ADD CONSTRAINT pick_tasks_target_xor
+    CHECK ((so_id IS NOT NULL AND to_id IS NULL)
+        OR (so_id IS NULL     AND to_id IS NOT NULL));
+
+INSERT INTO app_settings (key, value)
+VALUES ('transfer_order_block_self_approval', 'true')
+ON CONFLICT (key) DO NOTHING;
+
+-- ============================================================
+-- USER DASHBOARD PREFERENCES (v1.8.0 #283)
+-- ============================================================
+-- Per-user override storage for the productivity dashboard. Defaults
+-- are applied at read time when no row exists; this table is override
+-- storage, not a settings record. Identical DDL lives in
+-- db/migrations/051_user_dashboard_preferences.sql.
+
+CREATE TABLE user_dashboard_preferences (
+    user_id          INT PRIMARY KEY REFERENCES users(user_id) ON DELETE CASCADE,
+    chart_order      JSONB NOT NULL DEFAULT '["picking","packing","shipped","received_skus","putaway_skus"]'::jsonb,
+    default_range    VARCHAR(16) NOT NULL DEFAULT 'today'
+                       CHECK (default_range IN ('today','yesterday','last_7d','last_30d','custom')),
+    default_view     VARCHAR(8) NOT NULL DEFAULT 'charts'
+                       CHECK (default_view IN ('charts','table')),
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);

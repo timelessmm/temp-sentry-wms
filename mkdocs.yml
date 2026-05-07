@@ -42,6 +42,8 @@ nav:
   - Deployment: deployment.md
   - Admin Panel: admin-panel.md
   - Connectors: connectors.md
+  - ERP Integration: erp-integration.md
+  - Transfer Orders: transfer-orders.md
   - Test Lab: test-lab.md
   - Contributing: contributing.md
   - Changelog: changelog.md

@@ -40,6 +40,7 @@ import os
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from decimal import Decimal
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from uuid import UUID
 
@@ -220,29 +221,32 @@ def handle_inbound(
     """
     cfg = get_config(resource_key)
 
-    # v1.7.0 (#269): mapping_overrides is disabled until v1.7.1 resolves
-    # the source-path-remap vs canonical-value-replacement semantics
-    # ambiguity (see #270). Reject the request regardless of token
-    # capability so neither shape becomes the de-facto contract by
-    # accident. The capability column on wms_tokens stays so the v1.7.1
-    # decision lands without a migration.
-    overrides = body.get("mapping_overrides")
-    if overrides is not None:
+    # v1.8.0 (#270): mapping_overrides resolution.
+    #
+    # Per-request body-level overrides (Option A) stay rejected: the
+    # connector author cannot remap canonical fields by sneaking JSON
+    # into individual POSTs. Body-level Option A may land in v1.x if
+    # real demand surfaces; for v1.8 the surface is locked.
+    if body.get("mapping_overrides") is not None:
         return HandlerError(
             status_code=403,
             body={
-                "error_kind": "feature_not_available_in_v1_7_0",
+                "error_kind": "mapping_overrides_not_supported_in_body",
                 "detail": (
-                    "mapping_overrides is deferred to v1.7.1 pending "
-                    "semantics decision (#270)."
+                    "Per-request mapping_overrides is not supported. Issue "
+                    "a token with mapping_override=true and the desired "
+                    "mapping_overrides JSONB; per-token static overrides "
+                    "apply automatically. See docs/erp-integration.md."
                 ),
             },
         )
-    # Belt-and-braces: even with overrides=None, force the rest of the
-    # handler to behave as if the capability is absent. Future v1.7.x
-    # shouldn't accidentally reintroduce the value-replacement path
-    # without revisiting the gate.
+    # Per-token static overrides (Option B) apply only when both the
+    # capability flag is TRUE and the JSONB is non-empty. Migration 052
+    # ensures the column is NOT NULL DEFAULT '{}' so the empty-dict
+    # path is the universal default.
     overrides = None
+    if token.get("mapping_override") and token.get("mapping_overrides"):
+        overrides = token["mapping_overrides"]
 
     source_system: str = token["source_system"]
     external_id: str = body["external_id"]
@@ -375,10 +379,72 @@ def handle_inbound(
         if overrides
         else document.field_set(resource_key)
     )
+
+    # v1.8.0 (#300): warehouse_id token fallback. When the resolved
+    # canonical_payload has no warehouse_id (source did not provide,
+    # mapping doc did not declare a default) AND the token's
+    # warehouse_ids array carries at least one entry, fill in the
+    # first entry. Single-warehouse tokens (the common case for a
+    # connector author who scopes a token to one site) get the
+    # natural fallback without per-mapping-doc plumbing. Multi-
+    # warehouse tokens still take the first entry; operators who
+    # need different routing per inbound POST should set warehouse_id
+    # in source or declare a mapping doc default. Only sales_orders +
+    # purchase_orders have a warehouse_id column (items / customers
+    # / vendors are warehouse-agnostic by design).
+    if (
+        cfg.canonical_table in ("sales_orders", "purchase_orders")
+        and not canonical_payload.get("warehouse_id")
+        and token.get("warehouse_ids")
+    ):
+        canonical_payload["warehouse_id"] = int(token["warehouse_ids"][0])
+        write_field_set = write_field_set | {"warehouse_id"}
+
     is_new, canonical_id = _upsert_canonical(
         db, cfg, source_system, external_id, canonical_payload,
         write_field_set,
     )
+
+    # ----- Step 6.5: line-item write-through (v1.8.0 #289) -----
+    # PO + SO resources flow line_items through to the relational
+    # *_lines tables so receiving / picking can scan against them.
+    # Other resources (items / customers / vendors) have no line tables
+    # and the helper short-circuits.
+    try:
+        _write_inbound_lines(
+            db, document, resource_key, canonical_id, canonical_payload,
+        )
+    except CrossSystemLookupMiss as miss:
+        return HandlerError(
+            status_code=409,
+            body={
+                "error_kind": "cross_system_lookup_miss",
+                "missing": {
+                    "source_system": miss.source_system,
+                    "source_type": miss.source_type,
+                    "source_id": miss.source_id,
+                },
+                "message": (
+                    "Required cross-system lookup did not resolve on a "
+                    "line item. Ensure the referenced entity has been "
+                    "ingested."
+                ),
+            },
+        )
+    except _LinesInFlight as exc:
+        return HandlerError(
+            status_code=409,
+            body={
+                "error_kind": "lines_in_flight",
+                "message": str(exc),
+            },
+        )
+    except ValueError as exc:
+        return HandlerError(
+            status_code=422,
+            body={"error_kind": "mapping_apply_error",
+                  "message": str(exc)},
+        )
 
     # ----- Step 7: insert inbound row + supersede -----
     db.execute(
@@ -471,6 +537,11 @@ def _json_default(value: Any) -> Any:
         return str(value)
     if isinstance(value, datetime):
         return _iso(value)
+    if isinstance(value, Decimal):
+        # v1.8.0 (#285): mapping_loader now coerces type='decimal'
+        # to Decimal. Stored as a string in the JSONB so investigators
+        # can recover the exact value (vs JSON's lossy float).
+        return str(value)
     raise TypeError(f"non-serialisable value {type(value).__name__}: {value!r}")
 
 
@@ -602,3 +673,198 @@ def _write_audit_log(
             "d": json.dumps(details, default=_json_default),
         },
     )
+
+
+# ============================================================
+# v1.8.0 (#289) Line-item write-through
+# ============================================================
+#
+# v1.7 stored line_items only in inbound_<resource>.canonical_payload
+# JSONB; the relational *_lines tables stayed empty, leaving inbound
+# POs unreceivable and inbound SOs unallocatable. v1.8 walks the
+# resolved canonical_payload[<canonical_path>] list after the header
+# upsert and writes lines to purchase_order_lines / sales_order_lines
+# with FK to the just-upserted header.
+#
+# Items / customers / vendors do not have line_items wiring; the
+# helper short-circuits.
+
+
+class _LinesInFlight(Exception):
+    """Existing lines have downstream activity (PO: quantity_received
+    > 0; SO: any quantity_(allocated|picked|packed|shipped) > 0).
+    Replacing them would silently lose the warehouse-floor state, so
+    the handler returns 409 instead. Operator cancels or completes the
+    in-flight work before re-POSTing the upstream record."""
+
+
+_LINE_RESOURCE_SPECS = {
+    "purchase_orders": {
+        "header_pk_col": "po_id",
+        "line_table": "purchase_order_lines",
+        "downstream_predicate": "quantity_received > 0",
+        "downstream_label": "quantity_received",
+    },
+    "sales_orders": {
+        "header_pk_col": "so_id",
+        "line_table": "sales_order_lines",
+        "downstream_predicate": (
+            "quantity_allocated > 0 OR quantity_picked > 0 "
+            "OR quantity_packed > 0 OR quantity_shipped > 0"
+        ),
+        "downstream_label": "quantity_allocated/picked/packed/shipped",
+    },
+}
+
+
+def _resolve_item_int_id(db, item_external_id) -> Optional[int]:
+    """Translate an items.external_id UUID to the integer items.item_id
+    FK target. Returns None when no row matches; caller raises
+    CrossSystemLookupMiss with the unresolved UUID."""
+    if item_external_id is None:
+        return None
+    row = db.execute(
+        text("SELECT item_id FROM items WHERE external_id = :eid"),
+        {"eid": str(item_external_id)},
+    ).fetchone()
+    return row.item_id if row else None
+
+
+def _write_inbound_lines(db, document, resource_key, canonical_id,
+                          canonical_payload) -> None:
+    """v1.8.0 (#289): write inbound lines to the relational *_lines
+    table for purchase_orders + sales_orders.
+
+    No-op when:
+    - the resource has no line wiring (items / customers / vendors), OR
+    - the mapping doc declares no line_items block, OR
+    - the resolved line list is empty (header-only update; preserves
+      existing relational lines so a metadata re-POST does not nuke
+      receiving / picking work).
+
+    Raises:
+    - CrossSystemLookupMiss when a line's item_id (canonical UUID)
+      does not resolve to an items row.
+    - _LinesInFlight when existing lines have downstream activity
+      and replacement would lose state.
+    - ValueError on mapping shape errors (missing item_id / quantity
+      on a line) so the handler can surface a 422 with a clear
+      message.
+    """
+    spec = _LINE_RESOURCE_SPECS.get(resource_key)
+    if spec is None:
+        return  # items / customers / vendors
+
+    rm = document.resources.get(resource_key)
+    if rm is None or rm.line_items is None:
+        return  # mapping doc declares no line_items block
+
+    lines = canonical_payload.get(rm.line_items.canonical_path) or []
+    if not lines:
+        return  # header-only update preserves existing relational lines
+
+    # Resolve integer header PK; the just-upserted row must exist.
+    header_pk_col = spec["header_pk_col"]
+    canonical_table = resource_key  # plural form == canonical table name
+    header_row = db.execute(
+        text(
+            f"SELECT {header_pk_col} FROM {canonical_table} "
+            f" WHERE external_id = :cid"
+        ),
+        {"cid": str(canonical_id)},
+    ).fetchone()
+    if header_row is None:
+        raise RuntimeError(
+            f"line write-through: {canonical_table} row missing for "
+            f"canonical_id={canonical_id}"
+        )
+    header_pk = getattr(header_row, header_pk_col)
+
+    # Downstream-activity gate.
+    line_table = spec["line_table"]
+    in_flight = db.execute(
+        text(
+            f"SELECT COUNT(*) FROM {line_table} "
+            f" WHERE {header_pk_col} = :hpk "
+            f"   AND ({spec['downstream_predicate']})"
+        ),
+        {"hpk": header_pk},
+    ).scalar()
+    if in_flight > 0:
+        raise _LinesInFlight(
+            f"{resource_key}: {in_flight} existing line(s) on "
+            f"{header_pk_col}={header_pk} have downstream activity "
+            f"({spec['downstream_label']}). Cancel or complete the "
+            f"in-flight work before re-POST."
+        )
+
+    # Resolve each line: item UUID -> integer item_id; required quantity.
+    resolved: List[Dict[str, Any]] = []
+    for idx, line in enumerate(lines):
+        item_uuid = line.get("item_id")
+        if item_uuid is None:
+            raise ValueError(
+                f"{resource_key} line {idx}: item_id is required "
+                "(declare cross_system_lookup on the line_items field)"
+            )
+        item_int_id = _resolve_item_int_id(db, item_uuid)
+        if item_int_id is None:
+            raise CrossSystemLookupMiss(
+                source_system=document.source_system,
+                source_type="item",
+                source_id=str(item_uuid),
+            )
+        qty = line.get("quantity_ordered")
+        if qty is None:
+            raise ValueError(
+                f"{resource_key} line {idx}: quantity_ordered is required"
+            )
+        try:
+            qty_int = int(qty)
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"{resource_key} line {idx}: quantity_ordered "
+                f"{qty!r} is not an integer"
+            )
+        if qty_int <= 0:
+            raise ValueError(
+                f"{resource_key} line {idx}: quantity_ordered must be > 0"
+            )
+        line_number = line.get("line_number")
+        if line_number is None:
+            line_number = idx + 1
+        resolved.append({
+            "hpk": header_pk,
+            "item_id": item_int_id,
+            "qty": qty_int,
+            "ln": int(line_number),
+        })
+
+    # Replace lines: DELETE existing + INSERT new. Both purchase_order_lines
+    # and sales_order_lines accept (header_pk, item_id, quantity_ordered,
+    # line_number); other columns default. Items / customers / vendors are
+    # excluded above so the literal column lists below are exhaustive.
+    db.execute(
+        text(f"DELETE FROM {line_table} WHERE {header_pk_col} = :hpk"),
+        {"hpk": header_pk},
+    )
+    if resource_key == "purchase_orders":
+        for params in resolved:
+            db.execute(
+                text(
+                    "INSERT INTO purchase_order_lines "
+                    "(po_id, item_id, quantity_ordered, line_number) "
+                    "VALUES (:hpk, :item_id, :qty, :ln)"
+                ),
+                params,
+            )
+    else:  # sales_orders
+        for params in resolved:
+            db.execute(
+                text(
+                    "INSERT INTO sales_order_lines "
+                    "(so_id, item_id, quantity_ordered, line_number) "
+                    "VALUES (:hpk, :item_id, :qty, :ln)"
+                ),
+                params,
+            )

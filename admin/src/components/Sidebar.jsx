@@ -39,7 +39,8 @@ const NAV = [
       { to: '/items', label: 'Items' },
       { to: '/preferred-bins', label: 'Preferred Bins' },
       { to: '/adjustments', label: 'Adjustments' },
-      { to: '/inter-warehouse-transfers', label: 'Transfers' },
+      { to: '/transfer-orders', label: 'Transfer Orders' },
+      { to: '/inter-warehouse-transfers', label: 'Bin Transfers' },
     ],
   },
   {
@@ -75,6 +76,10 @@ export default function Sidebar() {
         '/packing': data.orders_to_pack || 0,
         '/shipping': data.orders_to_ship || 0,
         '/count-approvals': data.pending_adjustments || 0,
+        // v1.8.0 (#296): pending TO approvals scoped to the active
+        // warehouse (source OR destination match). Falls back to 0
+        // when the dashboard endpoint is the older shape.
+        '/transfer-orders': data.pending_to_approvals || 0,
       });
     });
   }, [location.pathname, warehouseId]);

@@ -140,6 +140,7 @@ def _insert_via_test_conn(ss, plaintext, **kw):
     runs (e.g., subsequent test files). Inserting via the test conn
     keeps the rows test-scoped."""
     import hashlib
+    import json as _json
     from _wms_token_helpers import PEPPER, DEFAULT_TEST_ENDPOINTS
 
     conn = db_test_context.get_raw_connection()
@@ -154,8 +155,10 @@ def _insert_via_test_conn(ss, plaintext, **kw):
         cur.execute(
             "INSERT INTO wms_tokens "
             "(token_name, token_hash, status, warehouse_ids, event_types, "
-            " endpoints, source_system, inbound_resources, mapping_override) "
-            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING token_id",
+            " endpoints, source_system, inbound_resources, mapping_override, "
+            " mapping_overrides) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb) "
+            "RETURNING token_id",
             (
                 kw.get("name", f"inbound-test-{uuid.uuid4().hex[:6]}"),
                 token_hash, "active",
@@ -165,6 +168,7 @@ def _insert_via_test_conn(ss, plaintext, **kw):
                 ss,
                 kw.get("inbound_resources", ["sales_orders"]),
                 kw.get("mapping_override", False),
+                _json.dumps(kw.get("mapping_overrides", {})),
             ),
         )
         token_id = cur.fetchone()[0]
@@ -496,3 +500,435 @@ class TestCrossSystemMappingsAutocreate:
         )
         assert rows
         assert str(rows[0][0]) == r.get_json()["canonical_id"]
+
+
+# ----------------------------------------------------------------------
+# v1.8.0 (#285) optional sales_orders cost fields with per-field decimal
+# bounds. order_total + customer_shipping_paid land via the same generic
+# inbound contract; bounds enforce wire-level rejection so a connector
+# author sees a clear 422 instead of silent rounding (excess scale) or
+# a 500 (excess precision from the NUMERIC(12,2) column).
+# ----------------------------------------------------------------------
+
+
+_COST_MAPPING = """\
+mapping_version: "1.0"
+source_system: "{ss}"
+version_compare: "iso_timestamp"
+resources:
+  sales_orders:
+    canonical_type: "sales_order"
+    fields:
+      - canonical: "so_number"
+        source_path: "$.orderNumber"
+        type: "string"
+        required: true
+      - canonical: "warehouse_id"
+        source_path: "$.warehouseId"
+        type: "integer"
+        required: true
+      - canonical: "order_total"
+        source_path: "$.order.total"
+        type: "decimal"
+        max_digits: 12
+        decimal_places: 2
+        ge: "0"
+        le: "9999999999.99"
+      - canonical: "customer_shipping_paid"
+        source_path: "$.order.shipping"
+        type: "decimal"
+        max_digits: 12
+        decimal_places: 2
+        ge: "0"
+        le: "9999999999.99"
+"""
+
+
+def _setup_cost(app, scenario, plaintext, **token_kw):
+    ss = scenario["ss"]
+    _build_registry(app, ss, _COST_MAPPING.format(ss=ss))
+    token_id = _make_token(ss, plaintext, **token_kw)
+    scenario["tokens"].append(token_id)
+    return ss
+
+
+class TestOptionalSalesOrderFields:
+    def test_both_fields_populate_canonical_columns(
+        self, client, app, scenario,
+    ):
+        ss = _setup_cost(app, scenario, "cost-1")
+        resp = _post(client, "cost-1", {
+            "external_id": "SO-COST-1",
+            "external_version": "2026-05-04T10:00:00+00:00",
+            "source_payload": {
+                "orderNumber": "SO-COST-1",
+                "warehouseId": 1,
+                "order": {"total": "123.45", "shipping": "9.99"},
+            },
+        })
+        assert resp.status_code == 201, resp.get_json()
+        scenario["canonical_external_ids"].append(resp.get_json()["canonical_id"])
+        rows = _query(
+            "SELECT order_total, customer_shipping_paid "
+            "  FROM sales_orders WHERE external_id = %s",
+            (resp.get_json()["canonical_id"],),
+        )
+        from decimal import Decimal
+        assert rows[0][0] == Decimal("123.45")
+        assert rows[0][1] == Decimal("9.99")
+
+    def test_neither_field_present_leaves_columns_null(
+        self, client, app, scenario,
+    ):
+        ss = _setup_cost(app, scenario, "cost-2")
+        resp = _post(client, "cost-2", {
+            "external_id": "SO-COST-2",
+            "external_version": "2026-05-04T10:00:00+00:00",
+            "source_payload": {
+                "orderNumber": "SO-COST-2",
+                "warehouseId": 1,
+                "order": {},
+            },
+        })
+        assert resp.status_code == 201, resp.get_json()
+        scenario["canonical_external_ids"].append(resp.get_json()["canonical_id"])
+        rows = _query(
+            "SELECT order_total, customer_shipping_paid "
+            "  FROM sales_orders WHERE external_id = %s",
+            (resp.get_json()["canonical_id"],),
+        )
+        assert rows[0] == (None, None)
+
+    def test_zero_distinguishable_from_null(self, client, app, scenario):
+        ss = _setup_cost(app, scenario, "cost-3")
+        resp = _post(client, "cost-3", {
+            "external_id": "SO-COST-3",
+            "external_version": "2026-05-04T10:00:00+00:00",
+            "source_payload": {
+                "orderNumber": "SO-COST-3",
+                "warehouseId": 1,
+                "order": {"total": "0", "shipping": "0.00"},
+            },
+        })
+        assert resp.status_code == 201, resp.get_json()
+        scenario["canonical_external_ids"].append(resp.get_json()["canonical_id"])
+        rows = _query(
+            "SELECT order_total, customer_shipping_paid "
+            "  FROM sales_orders WHERE external_id = %s",
+            (resp.get_json()["canonical_id"],),
+        )
+        from decimal import Decimal
+        assert rows[0][0] == Decimal("0")
+        assert rows[0][1] == Decimal("0")
+
+    def test_excess_scale_rejected_422(self, client, app, scenario):
+        ss = _setup_cost(app, scenario, "cost-4")
+        resp = _post(client, "cost-4", {
+            "external_id": "SO-COST-4",
+            "external_version": "2026-05-04T10:00:00+00:00",
+            "source_payload": {
+                "orderNumber": "SO-COST-4",
+                "warehouseId": 1,
+                "order": {"total": "12.345"},
+            },
+        })
+        assert resp.status_code == 422
+        body = resp.get_json()
+        assert body["error_kind"] == "mapping_apply_error"
+        assert "order_total" in body["message"]
+        assert "decimal place" in body["message"]
+
+    def test_excess_precision_rejected_422(self, client, app, scenario):
+        ss = _setup_cost(app, scenario, "cost-5")
+        resp = _post(client, "cost-5", {
+            "external_id": "SO-COST-5",
+            "external_version": "2026-05-04T10:00:00+00:00",
+            "source_payload": {
+                "orderNumber": "SO-COST-5",
+                "warehouseId": 1,
+                "order": {"total": "12345678901234"},
+            },
+        })
+        assert resp.status_code == 422
+        body = resp.get_json()
+        assert body["error_kind"] == "mapping_apply_error"
+        assert "order_total" in body["message"]
+
+    def test_negative_value_rejected_422(self, client, app, scenario):
+        ss = _setup_cost(app, scenario, "cost-6")
+        resp = _post(client, "cost-6", {
+            "external_id": "SO-COST-6",
+            "external_version": "2026-05-04T10:00:00+00:00",
+            "source_payload": {
+                "orderNumber": "SO-COST-6",
+                "warehouseId": 1,
+                "order": {"total": "-0.01"},
+            },
+        })
+        assert resp.status_code == 422
+        body = resp.get_json()
+        assert body["error_kind"] == "mapping_apply_error"
+        assert "order_total" in body["message"]
+        assert "ge=" in body["message"]
+
+    def test_above_le_rejected_422(self, client, app, scenario):
+        # NUMERIC(12,2) saturates max_digits=12 and le=9999999999.99
+        # at the same boundary; any value above the column's max trips
+        # one of the two bound checks (whichever fires first). Both
+        # are correct rejections; the contract is that the wire returns
+        # 422 with order_total in the message.
+        ss = _setup_cost(app, scenario, "cost-7")
+        resp = _post(client, "cost-7", {
+            "external_id": "SO-COST-7",
+            "external_version": "2026-05-04T10:00:00+00:00",
+            "source_payload": {
+                "orderNumber": "SO-COST-7",
+                "warehouseId": 1,
+                "order": {"total": "10000000000.00"},
+            },
+        })
+        assert resp.status_code == 422
+        body = resp.get_json()
+        assert body["error_kind"] == "mapping_apply_error"
+        assert "order_total" in body["message"]
+        assert ("le=" in body["message"]
+                or "significant digit" in body["message"])
+
+
+# ----------------------------------------------------------------------
+# v1.8.0 (#270) per-token mapping_overrides applied to canonical record
+# ----------------------------------------------------------------------
+
+
+class TestPerTokenMappingOverrides:
+    def test_overrides_applied_when_capability_and_jsonb_set(
+        self, client, app, scenario,
+    ):
+        ss = _setup_basic(
+            app, scenario, "ovr-1",
+            mapping_override=True,
+            mapping_overrides={"customer_name": "OVERRIDDEN"},
+        )
+        resp = _post(client, "ovr-1", {
+            "external_id": "SO-OVR-1",
+            "external_version": "2026-05-04T10:00:00+00:00",
+            "source_payload": {
+                "orderNumber": "SO-OVR-1",
+                "warehouseId": 1,
+                "customer": {"name": "FromSource"},
+            },
+        })
+        assert resp.status_code == 201, resp.get_json()
+        scenario["canonical_external_ids"].append(resp.get_json()["canonical_id"])
+        rows = _query(
+            "SELECT customer_name FROM sales_orders WHERE external_id = %s",
+            (resp.get_json()["canonical_id"],),
+        )
+        # Per-token override wins over the source-derived value.
+        assert rows[0][0] == "OVERRIDDEN"
+
+    def test_overrides_ignored_when_capability_flag_off(
+        self, client, app, scenario,
+    ):
+        # Capability flag FALSE + JSONB populated == handler skips
+        # the override path. (Schema validation prevents this shape
+        # at admin time, but a direct-DB insert can land it; the
+        # handler's gate is the runtime safety net.)
+        ss = _setup_basic(
+            app, scenario, "ovr-2",
+            mapping_override=False,
+            mapping_overrides={"customer_name": "SHOULD_NOT_APPLY"},
+        )
+        resp = _post(client, "ovr-2", {
+            "external_id": "SO-OVR-2",
+            "external_version": "2026-05-04T10:00:00+00:00",
+            "source_payload": {
+                "orderNumber": "SO-OVR-2",
+                "warehouseId": 1,
+                "customer": {"name": "FromSource"},
+            },
+        })
+        assert resp.status_code == 201, resp.get_json()
+        scenario["canonical_external_ids"].append(resp.get_json()["canonical_id"])
+        rows = _query(
+            "SELECT customer_name FROM sales_orders WHERE external_id = %s",
+            (resp.get_json()["canonical_id"],),
+        )
+        assert rows[0][0] == "FromSource"
+
+    def test_empty_jsonb_with_capability_set_no_op(
+        self, client, app, scenario,
+    ):
+        # Capability flag TRUE + empty JSONB == no override applied.
+        # (Standard token shape for inbound tokens that opt in but
+        # haven't configured any overrides yet.)
+        ss = _setup_basic(
+            app, scenario, "ovr-3",
+            mapping_override=True,
+            mapping_overrides={},
+        )
+        resp = _post(client, "ovr-3", {
+            "external_id": "SO-OVR-3",
+            "external_version": "2026-05-04T10:00:00+00:00",
+            "source_payload": {
+                "orderNumber": "SO-OVR-3",
+                "warehouseId": 1,
+                "customer": {"name": "FromSource"},
+            },
+        })
+        assert resp.status_code == 201
+        scenario["canonical_external_ids"].append(resp.get_json()["canonical_id"])
+        rows = _query(
+            "SELECT customer_name FROM sales_orders WHERE external_id = %s",
+            (resp.get_json()["canonical_id"],),
+        )
+        assert rows[0][0] == "FromSource"
+
+    def test_body_overrides_still_rejected_403(
+        self, client, app, scenario,
+    ):
+        # Per-request body-level overrides remain rejected; only the
+        # per-token static config is honored in v1.8.
+        ss = _setup_basic(
+            app, scenario, "ovr-4",
+            mapping_override=True,
+            mapping_overrides={"customer_name": "from-token"},
+        )
+        resp = _post(client, "ovr-4", {
+            "external_id": "SO-OVR-4",
+            "external_version": "2026-05-04T10:00:00+00:00",
+            "source_payload": {
+                "orderNumber": "SO-OVR-4",
+                "warehouseId": 1,
+                "customer": {"name": "x"},
+            },
+            "mapping_overrides": {"customer_name": "from-body"},
+        })
+        assert resp.status_code == 403
+        body = resp.get_json()
+        assert body["error_kind"] == "mapping_overrides_not_supported_in_body"
+
+
+# ----------------------------------------------------------------------
+# v1.8.0 (#300) warehouse_id token fallback
+# ----------------------------------------------------------------------
+
+
+_NO_WAREHOUSE_MAPPING = """\
+mapping_version: "1.0"
+source_system: "{ss}"
+version_compare: "iso_timestamp"
+resources:
+  sales_orders:
+    canonical_type: "sales_order"
+    fields:
+      - canonical: "so_number"
+        source_path: "$.orderNumber"
+        type: "string"
+        required: true
+      - canonical: "customer_name"
+        source_path: "$.customer.name"
+        type: "string"
+"""
+
+
+class TestWarehouseIdTokenFallback:
+    def test_token_fills_warehouse_when_source_omits(
+        self, client, app, scenario,
+    ):
+        ss = scenario["ss"]
+        _build_registry(app, ss, _NO_WAREHOUSE_MAPPING.format(ss=ss))
+        _make_token(ss, "wh-fb-1", warehouse_ids=[1])
+        resp = _post(client, "wh-fb-1", {
+            "external_id": "SO-WH-FB-1",
+            "external_version": "2026-05-04T10:00:00+00:00",
+            "source_payload": {
+                "orderNumber": "SO-WH-FB-1",
+                "customer": {"name": "FromSource"},
+            },
+        })
+        assert resp.status_code == 201, resp.get_json()
+        scenario["canonical_external_ids"].append(resp.get_json()["canonical_id"])
+        rows = _query(
+            "SELECT warehouse_id FROM sales_orders WHERE external_id = %s",
+            (resp.get_json()["canonical_id"],),
+        )
+        assert rows[0][0] == 1
+
+    def test_source_warehouse_id_wins_over_token_fallback(
+        self, client, app, scenario,
+    ):
+        # Mapping doc declares warehouse_id from source; fallback
+        # should NOT fire when the resolved value is non-null.
+        ss = scenario["ss"]
+        _build_registry(app, ss, _BASE_MAPPING.format(ss=ss, vc="iso_timestamp"))
+        _make_token(ss, "wh-fb-2", warehouse_ids=[1])
+        resp = _post(client, "wh-fb-2", {
+            "external_id": "SO-WH-FB-2",
+            "external_version": "2026-05-04T10:00:00+00:00",
+            "source_payload": {
+                "orderNumber": "SO-WH-FB-2",
+                "warehouseId": 1,
+                "customer": {"name": "FromSource"},
+            },
+        })
+        assert resp.status_code == 201
+        scenario["canonical_external_ids"].append(resp.get_json()["canonical_id"])
+        rows = _query(
+            "SELECT warehouse_id FROM sales_orders WHERE external_id = %s",
+            (resp.get_json()["canonical_id"],),
+        )
+        assert rows[0][0] == 1
+
+    def test_multi_warehouse_token_uses_first_entry(
+        self, client, app, scenario,
+    ):
+        ss = scenario["ss"]
+        _build_registry(app, ss, _NO_WAREHOUSE_MAPPING.format(ss=ss))
+        _make_token(ss, "wh-fb-3", warehouse_ids=[2, 1])
+        resp = _post(client, "wh-fb-3", {
+            "external_id": "SO-WH-FB-3",
+            "external_version": "2026-05-04T10:00:00+00:00",
+            "source_payload": {
+                "orderNumber": "SO-WH-FB-3",
+                "customer": {"name": "FromSource"},
+            },
+        })
+        assert resp.status_code == 201, resp.get_json()
+        scenario["canonical_external_ids"].append(resp.get_json()["canonical_id"])
+        rows = _query(
+            "SELECT warehouse_id FROM sales_orders WHERE external_id = %s",
+            (resp.get_json()["canonical_id"],),
+        )
+        # First entry (warehouse 2) wins; multi-warehouse tokens that
+        # need different routing per request must source warehouse_id
+        # from payload or mapping doc default.
+        assert rows[0][0] == 2
+
+    def test_empty_warehouse_token_still_fails_loud(
+        self, client, app, scenario,
+    ):
+        # Token with no warehouses + source missing warehouse_id ->
+        # canonical INSERT fails on NOT NULL. Surfaces as 422
+        # canonical_constraint_violation; no silent default behavior.
+        # NOTE: The decorator typically refuses inbound-only tokens
+        # with empty warehouse_ids; this test exercises the handler's
+        # behaviour, not the decorator gate, so we set warehouse_ids
+        # to [] explicitly.
+        ss = scenario["ss"]
+        _build_registry(app, ss, _NO_WAREHOUSE_MAPPING.format(ss=ss))
+        _make_token(ss, "wh-fb-4", warehouse_ids=[])
+        resp = _post(client, "wh-fb-4", {
+            "external_id": "SO-WH-FB-4",
+            "external_version": "2026-05-04T10:00:00+00:00",
+            "source_payload": {
+                "orderNumber": "SO-WH-FB-4",
+                "customer": {"name": "FromSource"},
+            },
+        })
+        # Either the decorator rejects (401 cross_direction_scope_violation)
+        # or the handler reaches the canonical INSERT and fails with
+        # 422 canonical_constraint_violation. Both encode the same
+        # operator-visible truth: a token with no warehouse cannot
+        # ingest orders without source-side warehouse_id.
+        assert resp.status_code in (401, 422), resp.get_json()

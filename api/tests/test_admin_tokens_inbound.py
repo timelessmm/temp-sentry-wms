@@ -261,3 +261,151 @@ class TestDeleteAuditTrail:
         assert prev["source_system"] == ss
         assert prev["inbound_resources"] == ["vendors"]
         assert prev["mapping_override"] is False
+
+
+# ----------------------------------------------------------------------
+# v1.8.0 (#270) per-token mapping_overrides JSONB
+# ----------------------------------------------------------------------
+
+
+class TestCreateWithMappingOverrides:
+    def test_empty_overrides_default_persists_empty_dict(
+        self, client, auth_headers, ss,
+    ):
+        _allowlist(ss)
+        resp = _post_create(client, auth_headers, {
+            "token_name": f"empty-{ss}",
+            "source_system": ss,
+            "inbound_resources": ["sales_orders"],
+            "mapping_override": False,
+        })
+        assert resp.status_code == 201
+        body = resp.get_json()
+        rows = _query(
+            "SELECT mapping_overrides FROM wms_tokens WHERE token_id = %s",
+            (body["token_id"],),
+        )
+        assert rows[0][0] == {}
+
+    def test_populated_overrides_persist_and_audit_keys_only(
+        self, client, auth_headers, ss,
+    ):
+        _allowlist(ss)
+        payload = {
+            "token_name": f"with-overrides-{ss}",
+            "source_system": ss,
+            "inbound_resources": ["sales_orders"],
+            "mapping_override": True,
+            "mapping_overrides": {
+                "warehouse_id": 1,
+                "status": "OPEN",
+            },
+        }
+        resp = _post_create(client, auth_headers, payload)
+        assert resp.status_code == 201, resp.get_json()
+        token_id = resp.get_json()["token_id"]
+
+        rows = _query(
+            "SELECT mapping_overrides FROM wms_tokens WHERE token_id = %s",
+            (token_id,),
+        )
+        assert rows[0][0] == {"warehouse_id": 1, "status": "OPEN"}
+
+        # Audit row carries keys, never values.
+        rows = _query(
+            "SELECT details FROM audit_log "
+            " WHERE entity_type = 'WMS_TOKEN' AND entity_id = %s "
+            "   AND action_type = 'TOKEN_ISSUE' "
+            " ORDER BY created_at DESC LIMIT 1",
+            (token_id,),
+        )
+        details = rows[0][0]
+        assert details["mapping_overrides_keys"] == ["status", "warehouse_id"]
+        assert "mapping_overrides" not in details
+        for forbidden in ("OPEN", "warehouse_id_1"):
+            assert forbidden not in str(details).split(
+                "mapping_overrides_keys"
+            )[0], "values must not appear in audit details"
+
+    def test_unknown_canonical_key_rejected_422(
+        self, client, auth_headers, ss,
+    ):
+        _allowlist(ss)
+        resp = _post_create(client, auth_headers, {
+            "token_name": f"bad-key-{ss}",
+            "source_system": ss,
+            "inbound_resources": ["sales_orders"],
+            "mapping_override": True,
+            "mapping_overrides": {
+                "warehouse_id": 1,
+                "totally_made_up_column": "x",
+            },
+        })
+        assert resp.status_code == 422, resp.get_json()
+        body = resp.get_json()
+        assert body["error"] == "unknown_mapping_overrides_keys"
+        assert body["unknown_keys"] == ["totally_made_up_column"]
+
+    def test_overrides_without_capability_rejected_422(
+        self, client, auth_headers, ss,
+    ):
+        _allowlist(ss)
+        resp = _post_create(client, auth_headers, {
+            "token_name": f"no-cap-{ss}",
+            "source_system": ss,
+            "inbound_resources": ["sales_orders"],
+            "mapping_override": False,
+            "mapping_overrides": {"warehouse_id": 1},
+        })
+        # Pydantic validator rejects half-configured shape: overrides
+        # set without the capability flag are a silent no-op token, so
+        # we surface the operator error at admin time. validate_body
+        # surfaces Pydantic ValidationError as 400 validation_error.
+        assert resp.status_code == 400
+        body = resp.get_json()
+        assert body.get("error") == "validation_error"
+
+    def test_uniform_audit_shape_when_no_overrides(
+        self, client, auth_headers, ss,
+    ):
+        # The audit shape is uniform across history going forward:
+        # every TOKEN_ISSUE row carries mapping_overrides_keys, even
+        # when the token has no overrides (empty list).
+        _allowlist(ss)
+        resp = _post_create(client, auth_headers, {
+            "token_name": f"uniform-{ss}",
+            "source_system": ss,
+            "inbound_resources": ["sales_orders"],
+            "mapping_override": False,
+        })
+        assert resp.status_code == 201
+        token_id = resp.get_json()["token_id"]
+        rows = _query(
+            "SELECT details FROM audit_log "
+            " WHERE entity_type = 'WMS_TOKEN' AND entity_id = %s "
+            "   AND action_type = 'TOKEN_ISSUE'",
+            (token_id,),
+        )
+        assert rows[0][0]["mapping_overrides_keys"] == []
+
+
+class TestListingExposesKeys:
+    def test_listing_returns_keys_not_values(
+        self, client, auth_headers, ss,
+    ):
+        _allowlist(ss)
+        resp = _post_create(client, auth_headers, {
+            "token_name": f"list-{ss}",
+            "source_system": ss,
+            "inbound_resources": ["sales_orders"],
+            "mapping_override": True,
+            "mapping_overrides": {"warehouse_id": 1},
+        })
+        token_id = resp.get_json()["token_id"]
+        list_resp = client.get("/api/admin/tokens", headers=auth_headers)
+        rows = [r for r in list_resp.get_json()["tokens"]
+                if r["token_id"] == token_id]
+        assert rows
+        row = rows[0]
+        assert row["mapping_overrides_keys"] == ["warehouse_id"]
+        assert "mapping_overrides" not in row

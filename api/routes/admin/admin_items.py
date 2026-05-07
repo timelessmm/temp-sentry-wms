@@ -579,12 +579,47 @@ def _import_sales_order(db, row: SalesOrderImportRow, default_warehouse_id=None)
     if not so_row:
         result = db.execute(
             text("""
-                INSERT INTO sales_orders (so_number, so_barcode, customer_name, customer_phone, customer_address, warehouse_id, order_date, status, external_id)
-                VALUES (:sn, :sn, :cust, :phone, :caddr, :wid, NOW(), 'OPEN', :ext_id)
+                INSERT INTO sales_orders (
+                    so_number, so_barcode, customer_name, customer_phone,
+                    customer_address, warehouse_id, order_date, status,
+                    external_id,
+                    billing_address_name, billing_address_line1, billing_address_line2,
+                    billing_address_city, billing_address_state,
+                    billing_address_postal_code, billing_address_country,
+                    billing_address_phone,
+                    shipping_address_name, shipping_address_line1, shipping_address_line2,
+                    shipping_address_city, shipping_address_state,
+                    shipping_address_postal_code, shipping_address_country,
+                    shipping_address_phone
+                )
+                VALUES (
+                    :sn, :sn, :cust, :phone, :caddr, :wid, NOW(), 'OPEN', :ext_id,
+                    :ba_name, :ba_l1, :ba_l2, :ba_city, :ba_state, :ba_pc, :ba_country, :ba_phone,
+                    :sa_name, :sa_l1, :sa_l2, :sa_city, :sa_state, :sa_pc, :sa_country, :sa_phone
+                )
                 RETURNING so_id
             """),
-            {"sn": row.so_number, "cust": row.customer, "phone": row.customer_phone,
-             "caddr": row.customer_address, "wid": warehouse_id, "ext_id": str(uuid.uuid4())},
+            {
+                "sn": row.so_number, "cust": row.customer, "phone": row.customer_phone,
+                "caddr": row.customer_address, "wid": warehouse_id,
+                "ext_id": str(uuid.uuid4()),
+                "ba_name":    row.billing_address_name,
+                "ba_l1":      row.billing_address_line1,
+                "ba_l2":      row.billing_address_line2,
+                "ba_city":    row.billing_address_city,
+                "ba_state":   row.billing_address_state,
+                "ba_pc":      row.billing_address_postal_code,
+                "ba_country": row.billing_address_country,
+                "ba_phone":   row.billing_address_phone,
+                "sa_name":    row.shipping_address_name,
+                "sa_l1":      row.shipping_address_line1,
+                "sa_l2":      row.shipping_address_line2,
+                "sa_city":    row.shipping_address_city,
+                "sa_state":   row.shipping_address_state,
+                "sa_pc":      row.shipping_address_postal_code,
+                "sa_country": row.shipping_address_country,
+                "sa_phone":   row.shipping_address_phone,
+            },
         )
         so_id = result.fetchone()[0]
     else:

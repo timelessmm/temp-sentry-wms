@@ -97,6 +97,7 @@ def _fetch_by_hash(token_hash: str) -> Optional[dict]:
                 SELECT token_id, token_name, token_hash, warehouse_ids,
                        event_types, endpoints, connector_id, status,
                        source_system, inbound_resources, mapping_override,
+                       mapping_overrides,
                        created_at, rotated_at, expires_at, revoked_at,
                        last_used_at
                   FROM wms_tokens
@@ -124,6 +125,11 @@ def _fetch_by_hash(token_hash: str) -> Optional[dict]:
         "source_system": row.source_system,
         "inbound_resources": list(row.inbound_resources) if row.inbound_resources else [],
         "mapping_override": row.mapping_override,
+        # v1.8.0 (#270): per-token static override map. Only consulted
+        # by the inbound handler when mapping_override is also TRUE.
+        # JSONB column has NOT NULL DEFAULT '{}' (mig 052) so the dict
+        # is always a real (possibly empty) dict, never None.
+        "mapping_overrides": dict(row.mapping_overrides) if row.mapping_overrides else {},
         "created_at": row.created_at,
         "rotated_at": row.rotated_at,
         "expires_at": row.expires_at,

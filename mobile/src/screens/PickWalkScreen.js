@@ -171,7 +171,16 @@ export default function PickWalkScreen({ navigation, route }) {
             ITEM {pickNumber} OF {totalPicks}
           </Text>
           <View style={styles.headerOrderRow}>
-            <Text style={styles.headerOrders}>{totalOrders} order{totalOrders !== 1 ? 's' : ''}</Text>
+            {/* v1.8.0 (#295) header swap: TO batches surface the TO
+                number; SO batches keep the existing "X orders"
+                count. task.to_number is set by the picking_service
+                discriminator branch when the active task is a TO
+                pick. */}
+            <Text style={styles.headerOrders}>
+              {task && task.to_number
+                ? `TO ${task.to_number}`
+                : `${totalOrders} order${totalOrders !== 1 ? 's' : ''}`}
+            </Text>
             <View style={styles.greenDot} />
           </View>
         </View>

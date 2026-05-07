@@ -270,12 +270,53 @@ resources:
             conn.close()
         assert n == 0
 
-    def test_sales_orders_billing_shipping_columns_resolve(
+    def test_sales_orders_structured_address_columns_resolve(
         self, tmp_mappings_dir, fresh_source_system
     ):
-        """Migration 046 added billing_address + shipping_address to
-        sales_orders. Pin the regression so a future schema rollback
-        doesn't pass boot silently."""
+        """v1.8.0 #288: migration 053 replaced the v1.7 mig 046
+        billing_address / shipping_address TEXT placeholders with 16
+        structured columns. Pin the regression so a future schema
+        rollback doesn't pass boot silently."""
+        _allowlist(fresh_source_system)
+        body = f"""\
+mapping_version: "1.0"
+source_system: "{fresh_source_system}"
+version_compare: "iso_timestamp"
+resources:
+  sales_orders:
+    canonical_type: "sales_order"
+    fields:
+      - canonical: "billing_address_name"
+        source_path: "$.billing.name"
+        type: "string"
+      - canonical: "billing_address_line1"
+        source_path: "$.billing.line1"
+        type: "string"
+      - canonical: "billing_address_postal_code"
+        source_path: "$.billing.zip"
+        type: "string"
+      - canonical: "shipping_address_name"
+        source_path: "$.shipping.name"
+        type: "string"
+      - canonical: "shipping_address_line1"
+        source_path: "$.shipping.line1"
+        type: "string"
+      - canonical: "shipping_address_postal_code"
+        source_path: "$.shipping.zip"
+        type: "string"
+"""
+        path = tmp_mappings_dir / f"{fresh_source_system}.yaml"
+        path.write_text(body)
+        registry = boot_load(DATABASE_URL, tmp_mappings_dir)
+        assert registry.for_source(fresh_source_system) is not None
+
+    def test_v17_billing_address_canonical_now_rejected(
+        self, tmp_mappings_dir, fresh_source_system
+    ):
+        """v1.8.0 #288 reverse net: a mapping doc still using the v1.7
+        billing_address / shipping_address canonical names fails boot
+        loud (the columns are dropped). Operators see a clear path-
+        and-field error and migrate to the per-component fields."""
         _allowlist(fresh_source_system)
         body = f"""\
 mapping_version: "1.0"
@@ -288,14 +329,11 @@ resources:
       - canonical: "billing_address"
         source_path: "$.billingAddress"
         type: "string"
-      - canonical: "shipping_address"
-        source_path: "$.shippingAddress"
-        type: "string"
 """
         path = tmp_mappings_dir / f"{fresh_source_system}.yaml"
         path.write_text(body)
-        registry = boot_load(DATABASE_URL, tmp_mappings_dir)
-        assert registry.for_source(fresh_source_system) is not None
+        with pytest.raises(RuntimeError, match="billing_address"):
+            boot_load(DATABASE_URL, tmp_mappings_dir)
 
 
 class TestBootLoadDerivedExpressionValidation:

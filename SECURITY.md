@@ -357,6 +357,21 @@ deployments cannot reproduce the exposure.
   the OpenAPI spec at `docs/api/inbound-openapi.yaml` mark
   every field accordingly.
 
+### Transfer Orders + per-token mapping_overrides (v1.8.0)
+- TO admin surface (`/api/admin/transfer-orders/*` + `/api/admin/picker/transfer-orders/*`) is cookie-auth + ADMIN role for write paths; the picker-submit endpoint is cookie-auth + any authenticated user (the picker is not necessarily an admin). Inventory movement happens only at admin **approve** -- pickers cannot move stock unilaterally.
+- Self-approval gate via `app_settings.transfer_order_block_self_approval` (mig 049 seeded TRUE) blocks the same admin from approving their own picker submission. A different admin must approve unless an operator explicitly flips the setting (single-admin warehouse exception).
+- TO state machines (header / line / approval) are explicitly enumerated in `services.transfer_order_service`; every transition is a code path with audit + event wiring. Closure derivation (`evaluate_to_closure`) requires every line to be APPROVED with `approved_qty == picked_qty` (or SHORT_CLOSED) AND no PENDING approvals -- no implicit "looks done" state.
+- Over-pick guard at the SQL layer: `update_transfer_order_line_picked` issues an UPDATE with `WHERE picked_qty + :delta <= committed_qty AND status IN (PENDING, PARTIALLY_PICKED)`. A second concurrent picker attempting to push past the cap gets a zero-row UPDATE; the helper raises `OverPickAttempt` and the route surfaces 409 -- no FOR UPDATE round-trip required.
+- Inventory locking pattern: TO import + cancel + delete + start-picking + approve + short-close all walk inventory rows in `inventory_id ASC` so concurrent SO + TO operations on the same item acquire row locks in identical order (deadlock prevention; matches `picking_service.create_pick_batch_for_orders` lock ordering).
+- TO outbound event: `transfer.completed/1` emits via the `integration_events` outbox at admin-approve time with `aggregate_id = to_approval_id` (one event per approval batch, idempotent on the existing `(aggregate_type, aggregate_id, event_type, source_txn_id)` UNIQUE constraint). Reject does NOT emit -- consumers see a transfer only when stock actually moved.
+- Per-token static `mapping_overrides` JSONB (mig 052) with the v1.7 `mapping_override` BOOLEAN as the gate: overrides apply only when both flag is TRUE and JSONB non-empty. Admin issue route validates every key against `information_schema.columns` for the token's `inbound_resources` canonical tables (422 `unknown_mapping_overrides_keys`). Audit shape uniform: every TOKEN_ISSUE / TOKEN_ROTATE / TOKEN_DELETE row carries `mapping_overrides_keys` (sorted, **never values** -- values may include defaults that look credential-shaped to a log scraper). Per-request body overrides remain rejected with 403 `mapping_overrides_not_supported_in_body`.
+- Inbound payload `warehouse_id` token fallback: when source omits `warehouse_id`, the handler fills in `token.warehouse_ids[0]`. Multi-warehouse tokens take the first entry; operators who need different per-request routing must source-side `warehouse_id` or declare a mapping doc default. Token without warehouse + source omits warehouse_id -> 422 `canonical_constraint_violation` (no silent default).
+
+### Productivity Dashboard (v1.8.0)
+- `/api/v1/dashboard/productivity` (cookie + ADMIN) reads from `audit_log` (canonical "who did what") via the new `ix_audit_log_dashboard` covering index. Date range capped at 90 days at the Pydantic layer (422 `range_too_large`); `end < start` returns 422 `validation_error`. The 90-day cap prevents DoS via "give me last 10 years."
+- `/api/v1/dashboard/preferences` derives `user_id` from `g.current_user` only. Body `extra='forbid'` blocks any `user_id` smuggle attempt (CSRF / IDOR protection). `chart_order` keys validated against the `DASHBOARD_EVENTS` allowlist; duplicates rejected.
+- 60s in-process TTL cache per `(warehouse_id, start, end)` per worker. Cache is read-only memory; no cross-worker pubsub layer (60s staleness across workers is acceptable for a refresh-driven view).
+
 ### Forensic triggers and audit_log coverage (v1.5.1, v1.6.0, v1.7.0)
 - `wms_tokens_audit`, `webhook_subscriptions_audit`,
   `webhook_secrets_audit`, `inbound_source_systems_allowlist_audit`,

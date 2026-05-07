@@ -435,6 +435,31 @@ def dashboard():
         {"adj_pending": ADJ_PENDING},
     ).scalar()
 
+    # v1.8.0 (#296) pending TO approvals scoped to the requested
+    # warehouse. A TO touches a warehouse when it appears as either
+    # source or destination, so the count surfaces work the operator
+    # at this warehouse needs to act on.
+    if warehouse_id:
+        pending_to_approvals = g.db.execute(
+            text(
+                """
+                SELECT COUNT(*) FROM transfer_order_approvals tap
+                  JOIN transfer_orders o ON o.to_id = tap.to_id
+                 WHERE tap.status = 'PENDING'
+                   AND (o.source_warehouse_id = :wid
+                        OR o.destination_warehouse_id = :wid)
+                """
+            ),
+            {"wid": warehouse_id},
+        ).scalar()
+    else:
+        pending_to_approvals = g.db.execute(
+            text(
+                "SELECT COUNT(*) FROM transfer_order_approvals "
+                " WHERE status = 'PENDING'"
+            ),
+        ).scalar()
+
     result = {
         "open_pos": open_pos,
         "pending_receipts": int(pending_receipts),
@@ -449,6 +474,7 @@ def dashboard():
         "short_picks_7d": short_pick_count,
         "low_stock_items": low_stock,
         "pending_adjustments": pending_adjustments,
+        "pending_to_approvals": pending_to_approvals,
         "recent_activity": [
             {"action": r.action_type, "user": r.user_id,
              "detail": str(r.details) if r.details else None,

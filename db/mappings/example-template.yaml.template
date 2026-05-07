@@ -148,13 +148,19 @@ resources:
         required: true
 
       - canonical: "warehouse_id"
-        # required: true -- sales_orders.warehouse_id is NOT NULL
-        # with no default and FK-references warehouses(warehouse_id).
-        # The handler will 422 if absent or if the value does not
-        # match an existing warehouse.
+        # sales_orders.warehouse_id is NOT NULL with no default and
+        # FK-references warehouses(warehouse_id). v1.8.0 (#300) adds
+        # a token-fallback: when this field is absent / null AND the
+        # issuing token's warehouse_ids array carries at least one
+        # entry, the handler fills in token.warehouse_ids[0]. So the
+        # mapping doc can leave required: false (or omit warehouse_id
+        # entirely) when each token is scoped to one warehouse.
+        # Multi-warehouse tokens still take the first entry; tighten
+        # the mapping doc with required: true when source-side
+        # routing matters.
         source_path: "$.warehouse_id"
         type: "integer"           # accepts int or numeric string; cast to int.
-        required: true
+        required: false
 
       - canonical: "customer_id"
         # cross_system_lookup advanced feature. When the source-system
@@ -198,15 +204,120 @@ resources:
         type: "iso_timestamp"
         required: false
 
-      - canonical: "billing_address"
-        source_path: "$.billing.address"
+      # ----- v1.8.0 (#288): structured billing + shipping address -----
+      # Replaces the v1.7 single-TEXT billing_address / shipping_address
+      # placeholders. Each address component maps to its own canonical
+      # column so operators can edit, query, and export per-component.
+      # All 16 fields are optional; absent canonical columns store NULL.
+
+      - canonical: "billing_address_name"
+        source_path: "$.billing.name"
+        type: "string"
+        required: false
+      - canonical: "billing_address_line1"
+        source_path: "$.billing.address.line1"
+        type: "string"
+        required: false
+      - canonical: "billing_address_line2"
+        source_path: "$.billing.address.line2"
+        type: "string"
+        required: false
+      - canonical: "billing_address_city"
+        source_path: "$.billing.address.city"
+        type: "string"
+        required: false
+      - canonical: "billing_address_state"
+        source_path: "$.billing.address.state"   # state / province / region (free text)
+        type: "string"
+        required: false
+      - canonical: "billing_address_postal_code"
+        source_path: "$.billing.address.zip"
+        type: "string"
+        required: false
+      - canonical: "billing_address_country"
+        source_path: "$.billing.address.country"  # ISO-3166 code or country name; operator convention
+        type: "string"
+        required: false
+      - canonical: "billing_address_phone"
+        source_path: "$.billing.phone"
         type: "string"
         required: false
 
-      - canonical: "shipping_address"
-        source_path: "$.shipping.address"
+      - canonical: "shipping_address_name"
+        source_path: "$.shipping.name"
         type: "string"
         required: false
+      - canonical: "shipping_address_line1"
+        source_path: "$.shipping.address.line1"
+        type: "string"
+        required: false
+      - canonical: "shipping_address_line2"
+        source_path: "$.shipping.address.line2"
+        type: "string"
+        required: false
+      - canonical: "shipping_address_city"
+        source_path: "$.shipping.address.city"
+        type: "string"
+        required: false
+      - canonical: "shipping_address_state"
+        source_path: "$.shipping.address.state"
+        type: "string"
+        required: false
+      - canonical: "shipping_address_postal_code"
+        source_path: "$.shipping.address.zip"
+        type: "string"
+        required: false
+      - canonical: "shipping_address_country"
+        source_path: "$.shipping.address.country"
+        type: "string"
+        required: false
+      - canonical: "shipping_address_phone"
+        source_path: "$.shipping.phone"
+        type: "string"
+        required: false
+
+      # ----- ADVANCED: per-field decimal bounds (v1.8.0 #285) -----
+      # type='decimal' fields accept four optional bound attributes
+      # that mirror the canonical column's NUMERIC(p,s) precision +
+      # any business-level value range. When declared, the inbound
+      # handler returns 422 mapping_apply_error on violation rather
+      # than letting Postgres silently round excess scale or 500 on
+      # excess precision:
+      #
+      #   max_digits      -- max significant digits (mirror NUMERIC(p,...))
+      #   decimal_places  -- max digits after the decimal point (mirror NUMERIC(...,s))
+      #   ge              -- value must be >= this (lower bound, inclusive)
+      #   le              -- value must be <= this (upper bound, inclusive)
+      #
+      # Bounds are optional; omitting them preserves the v1.7 pass-
+      # through behaviour. Declared values are quoted strings so YAML
+      # does not coerce them to float and lose precision.
+
+      - canonical: "order_total"
+        # canonical column: sales_orders.order_total NUMERIC(12,2).
+        # Bounds match the column exactly so a connector author sees
+        # the constraint as a clear 422 with the field name, rather
+        # than a silent round (excess scale -> Postgres rounds to 2dp)
+        # or a 500 (excess precision -> NumericValueOutOfRange).
+        source_path: "$.order.total"
+        type: "decimal"
+        required: false
+        max_digits: 12
+        decimal_places: 2
+        ge: "0"
+        le: "9999999999.99"
+
+      - canonical: "customer_shipping_paid"
+        # canonical column: sales_orders.customer_shipping_paid
+        # NUMERIC(12,2). Same bounds as order_total. Consumed by
+        # dockd's carrier optimization engine in v1.9.
+        source_path: "$.order.shipping"
+        type: "decimal"
+        required: false
+        max_digits: 12
+        decimal_places: 2
+        ge: "0"
+        le: "9999999999.99"
 
       - canonical: "status"
         # The canonical column has DEFAULT 'OPEN'. If the source
@@ -250,6 +361,31 @@ resources:
       #   derived:
       #     expression: "str(source.shipping.address) + ' (priority shipping)'"
       #     when_present: "$.priority"
+
+    # ----- v1.8.0 (#289) line_items write-through -----
+    # Each line below the source_path resolves into a row in
+    # sales_order_lines. Items must already exist in Sentry +
+    # cross_system_mappings (via prior /api/v1/inbound/items POSTs OR
+    # admin UI item create) so the cross_system_lookup on `item_id`
+    # resolves the source SKU to the canonical UUID. Required canonical
+    # fields per line: item_id (UUID) and quantity_ordered (integer).
+    # line_number is auto-assigned 1..N when omitted. The 0 defaults
+    # for quantity_(allocated|picked|packed|shipped) come from the
+    # canonical schema.
+    line_items:
+      source_path: "$.line_items"
+      canonical_path: "lines"
+      fields:
+        - canonical: "item_id"
+          source_path: "$.sku"
+          type: "uuid"
+          required: true
+          cross_system_lookup:
+            source_type: "item"
+        - canonical: "quantity_ordered"
+          source_path: "$.quantity_ordered"
+          type: "integer"
+          required: true
 
   # =================================================================
   # ITEMS  (canonical table: items)
@@ -374,11 +510,16 @@ resources:
         required: true
 
       - canonical: "warehouse_id"
-        # required: true -- purchase_orders.warehouse_id is NOT NULL
-        # with no default and FK-references warehouses(warehouse_id).
+        # purchase_orders.warehouse_id is NOT NULL with no default
+        # and FK-references warehouses(warehouse_id). v1.8.0 (#300)
+        # adds a token-fallback: when this field is absent / null
+        # AND the issuing token's warehouse_ids array carries at
+        # least one entry, the handler fills in token.warehouse_ids[0].
+        # See sales_orders warehouse_id comment for the full
+        # operator-side semantics.
         source_path: "$.warehouse_id"
         type: "integer"
-        required: true
+        required: false
 
       - canonical: "vendor_id"
         # Same cross_system_lookup pattern as sales_orders.customer_id.
@@ -425,6 +566,34 @@ resources:
         type: "string"
         required: false
 
+    # ----- v1.8.0 (#289) line_items write-through -----
+    # Each line below the source_path resolves into a row in
+    # purchase_order_lines. Items must already exist in Sentry +
+    # cross_system_mappings (via prior /api/v1/inbound/items POSTs OR
+    # admin UI item create) so the cross_system_lookup on `item_id`
+    # resolves the source SKU to the canonical UUID. Required canonical
+    # fields per line: item_id (UUID) and quantity_ordered (integer).
+    # line_number is auto-assigned 1..N when omitted.
+    line_items:
+      source_path: "$.line_items"
+      canonical_path: "lines"
+      fields:
+        - canonical: "item_id"
+          source_path: "$.sku"
+          type: "uuid"
+          required: true
+          cross_system_lookup:
+            source_type: "item"
+        - canonical: "quantity_ordered"
+          source_path: "$.quantity_ordered"
+          type: "integer"
+          required: true
+        # Optional: declare line_number to honor the source's ordering
+        # rather than auto-assigning.
+        # - canonical: "line_number"
+        #   source_path: "$.line_number"
+        #   type: "integer"
+
 # =====================================================================
 # Common pitfalls
 # =====================================================================
@@ -452,24 +621,31 @@ resources:
 #    investigators can correlate which mapping doc was active when
 #    a given inbound POST was processed.
 #
-# 5. `mapping_overrides` is reserved for v1.7.1 and currently
-#    rejected. The InboundBody schema accepts a top-level
-#    `mapping_overrides` dict, but the v1.7.0 handler rejects every
-#    request that carries one with 403 feature_not_available_in_v1_7_0
-#    regardless of token capability flags. Do not include
-#    `mapping_overrides` in inbound POST bodies until v1.7.1 ships
-#    the per-request override semantics (see #270).
+# 5. `mapping_overrides` lives on the token, not the request body
+#    (v1.8.0 #270). Per-request body-level mapping_overrides is
+#    rejected with 403 mapping_overrides_not_supported_in_body. The
+#    v1.8.0 surface is per-token static config: issue a token with
+#    `mapping_override: true` and a non-empty `mapping_overrides`
+#    JSONB; the inbound handler applies the JSONB to the canonical
+#    record after the mapping doc translates the source. See
+#    docs/erp-integration.md for the operator-facing reference.
+#    Per-request body overrides (Option A) remain deferred to v1.x.
 #
-# 6. `line_items` mappings are accepted but not written to *_lines
-#    tables in v1.7.0. The mapping-loader supports `line_items:` at
-#    the resource level (with its own `source_path`,
-#    `canonical_path`, and field list); the inbound handler stores
-#    them in the inbound staging row's canonical_payload JSONB
-#    column. Sync to *_lines tables (`sales_order_lines`,
-#    `purchase_order_lines`, `item_fulfillment_lines`) lands at
-#    v1.8+. If you need the line list in canonical_payload for
-#    forensic/replay purposes, add a `line_items:` block; otherwise
-#    omit and the line array stays in source_payload only.
+# 6. `line_items` write through to the relational *_lines tables
+#    for purchase_orders + sales_orders (v1.8.0 #289). Items must be
+#    pre-loaded into Sentry first (via inbound POST or admin UI) so
+#    the line's `cross_system_lookup` on item_id resolves. Required
+#    canonical fields per line: `item_id` (UUID via cross_system_lookup)
+#    and `quantity_ordered` (integer). `line_number` is auto-assigned
+#    1..N when omitted. See the example PO + SO line_items blocks
+#    above. Re-POST with same external_id replaces lines via DELETE
+#    + INSERT only when no downstream activity exists; receiving in
+#    progress on a PO (`quantity_received > 0`) or allocation /
+#    pick / pack / ship in progress on a SO returns 409
+#    `lines_in_flight` so the warehouse-floor state is preserved.
+#    items / customers / vendors resources do not have line_items
+#    wiring (no relational *_lines table). item_fulfillment_lines
+#    sync stays Sentry-internal (the ship action creates them).
 #
 # 7. Optional advanced mapping-loader features not shown above:
 #
