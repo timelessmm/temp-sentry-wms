@@ -5,14 +5,23 @@ import { colors, fonts, radii } from '../theme/styles';
 export default function ActiveBatchBanner({ batch, onResume, onDismiss, onDelete }) {
   if (!batch) return null;
 
+  // v1.8.0 (#295): TO batches surface the TO number in the detail
+  // line instead of the SO order count (which is always 0 for TO
+  // batches because pick_batch_orders only links to SOs by design).
+  const isTransferOrder = batch.kind === 'TO' && batch.to_number;
+
   return (
     <View style={styles.container}>
-      <Text style={styles.label}>ACTIVE BATCH</Text>
+      <Text style={styles.label}>
+        {isTransferOrder ? 'ACTIVE TRANSFER' : 'ACTIVE BATCH'}
+      </Text>
       <Text style={styles.message}>
         {batch.completed_picks} of {batch.total_picks} picks done
       </Text>
       <Text style={styles.detail}>
-        {batch.total_orders} order{batch.total_orders !== 1 ? 's' : ''}
+        {isTransferOrder
+          ? `TO ${batch.to_number}`
+          : `${batch.total_orders} order${batch.total_orders !== 1 ? 's' : ''}`}
       </Text>
       <View style={styles.actions}>
         {onDelete && (

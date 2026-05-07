@@ -233,6 +233,23 @@ def get_batch_tasks(db, batch_id):
 
     tasks = _get_tasks_for_batch(db, batch_id)
 
+    # v1.8.0 (#295): TO batch detection. pick_batch_orders is empty for
+    # a TO batch (no SO joins); the TO header surfaces via pick_tasks
+    # discriminator -> transfer_orders.
+    to_row = db.execute(
+        text(
+            """
+            SELECT DISTINCT pt.to_id, o.to_number
+              FROM pick_tasks pt
+              JOIN transfer_orders o ON o.to_id = pt.to_id
+             WHERE pt.batch_id = :bid
+             LIMIT 1
+            """
+        ),
+        {"bid": batch_id},
+    ).fetchone()
+    kind = "TO" if to_row else "SO"
+
     return {
         "batch_id": batch.batch_id,
         "batch_number": batch.batch_number,
@@ -241,10 +258,16 @@ def get_batch_tasks(db, batch_id):
         "total_items": batch.total_items,
         "orders": [{"so_number": o.so_number, "tote_number": o.tote_number} for o in orders],
         "tasks": tasks,
+        "kind": kind,
+        "to_id": to_row.to_id if to_row else None,
+        "to_number": to_row.to_number if to_row else None,
     }
 
 
 def get_next_task(db, batch_id):
+    # v1.8.0 (#295): LEFT JOIN sales_orders + transfer_orders so the
+    # row resolves regardless of the pick_tasks discriminator. so_number
+    # is NULL for TO tasks; to_number is NULL for SO tasks.
     row = db.execute(
         text(
             """
@@ -253,12 +276,14 @@ def get_next_task(db, batch_id):
                    b.bin_code, b.bin_barcode, b.aisle, b.row_num, b.level_num,
                    i.sku, i.item_name, i.upc,
                    so.so_number,
+                   tro.to_number,
                    z.zone_name
             FROM pick_tasks pt
             JOIN bins b ON b.bin_id = pt.bin_id
             LEFT JOIN zones z ON z.zone_id = b.zone_id
             JOIN items i ON i.item_id = pt.item_id
-            JOIN sales_orders so ON so.so_id = pt.so_id
+            LEFT JOIN sales_orders so ON so.so_id = pt.so_id
+            LEFT JOIN transfer_orders tro ON tro.to_id = pt.to_id
             WHERE pt.batch_id = :bid AND pt.status = :task_pending
             ORDER BY pt.pick_sequence ASC
             LIMIT 1
@@ -1166,6 +1191,9 @@ def _get_contributing_orders(db, pick_task_id):
 
 
 def _get_tasks_for_batch(db, batch_id):
+    # v1.8.0 (#295): LEFT JOIN sales_orders + transfer_orders so TO
+    # tasks resolve too; so_number is NULL for TO rows and to_number
+    # is NULL for SO rows.
     rows = db.execute(
         text(
             """
@@ -1174,12 +1202,14 @@ def _get_tasks_for_batch(db, batch_id):
                    b.bin_code, b.bin_barcode, b.aisle, b.row_num, b.level_num,
                    i.sku, i.item_name, i.upc,
                    so.so_number,
+                   tro.to_number,
                    z.zone_name
             FROM pick_tasks pt
             JOIN bins b ON b.bin_id = pt.bin_id
             LEFT JOIN zones z ON z.zone_id = b.zone_id
             JOIN items i ON i.item_id = pt.item_id
-            JOIN sales_orders so ON so.so_id = pt.so_id
+            LEFT JOIN sales_orders so ON so.so_id = pt.so_id
+            LEFT JOIN transfer_orders tro ON tro.to_id = pt.to_id
             WHERE pt.batch_id = :bid
             ORDER BY pt.pick_sequence ASC, b.bin_code ASC
             """
@@ -1206,6 +1236,10 @@ def _task_row_to_dict(row):
         "quantity_to_pick": row.quantity_to_pick,
         "tote_number": row.tote_number,
         "so_number": row.so_number,
+        # v1.8.0 (#295): TO discriminator. NULL when this row is a
+        # SO pick (so_number set instead). Mobile renders the
+        # appropriate header based on whichever is non-null.
+        "to_number": getattr(row, "to_number", None),
         "status": row.status,
     }
 
