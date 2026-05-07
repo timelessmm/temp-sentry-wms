@@ -765,3 +765,199 @@ def import_transfer_order():
         "line_count": len(line_inserts),
         "shortages": shortages,
     }), 201
+
+
+# ============================================================
+# Start-picking (#292)
+# ============================================================
+
+
+@admin_bp.route(
+    "/transfer-orders/<int:to_id>/start-picking", methods=["POST"],
+)
+@require_auth
+@require_role("ADMIN")
+@with_db
+def start_to_picking(to_id):
+    """Create a pick_batch + pick_tasks for the TO so the picker can
+    scan via the existing mobile picking flow.
+
+    One pick_task per (TO line, inventory bin) at the source warehouse,
+    consuming committed_qty across bins in inventory_id ASC. Bin-level
+    distribution mirrors picking_service.create_pick_batch_for_orders
+    so concurrent SO + TO batch creation acquires inventory locks in
+    the same order. The XOR CHECK from mig 049 enforces so_id NULL +
+    to_id NOT NULL on every inserted row.
+    """
+    header = g.db.execute(
+        text(
+            "SELECT to_id, to_number, status, source_warehouse_id "
+            "  FROM transfer_orders WHERE to_id = :tid FOR UPDATE"
+        ),
+        {"tid": to_id},
+    ).fetchone()
+    if not header:
+        return jsonify({"error": "Transfer order not found"}), 404
+    if header.status not in (TO_STATUS_OPEN, TO_STATUS_PARTIALLY_PICKED):
+        return jsonify({
+            "error": "invalid_status_for_start_picking",
+            "current_status": header.status,
+        }), 409
+
+    # Lines that still need picking (committed > picked) and are not
+    # SHORT_CLOSED. Walk in line_number ASC for predictable picker UX.
+    lines = g.db.execute(
+        text(
+            """
+            SELECT to_line_id, item_id, line_number,
+                   committed_qty, picked_qty
+              FROM transfer_order_lines
+             WHERE to_id = :tid
+               AND status IN ('PENDING', 'PARTIALLY_PICKED')
+               AND committed_qty > picked_qty
+             ORDER BY line_number
+            """
+        ),
+        {"tid": to_id},
+    ).fetchall()
+    if not lines:
+        return jsonify({
+            "error": "no_lines_to_pick",
+            "detail": "Every line is either fully picked or short-closed.",
+        }), 409
+
+    # Create pick_batch anchor.
+    from datetime import datetime
+    batch_number = (
+        f"BATCH-TO-{header.to_number[3:]}-"
+        f"{datetime.now().strftime('%H%M%S%f')[:9]}"
+    )
+    batch_row = g.db.execute(
+        text(
+            "INSERT INTO pick_batches "
+            "(batch_number, warehouse_id, status, assigned_to) "
+            "VALUES (:bn, :wid, 'OPEN', :user) RETURNING batch_id"
+        ),
+        {
+            "bn": batch_number,
+            "wid": header.source_warehouse_id,
+            "user": g.current_user["username"],
+        },
+    ).fetchone()
+    batch_id = batch_row.batch_id
+
+    # For each line, walk inventory bins at the source warehouse (in
+    # inventory_id ASC) and create pick_tasks until the line's
+    # remaining commitment is covered.
+    pick_sequence = 0
+    tasks_created = 0
+    for line in lines:
+        remaining = line.committed_qty - line.picked_qty
+        inv_rows = g.db.execute(
+            text(
+                """
+                SELECT inv.inventory_id, inv.bin_id, inv.quantity_on_hand,
+                       inv.quantity_allocated
+                  FROM inventory inv
+                 WHERE inv.item_id = :iid AND inv.warehouse_id = :wid
+                   AND inv.quantity_on_hand > 0
+                 ORDER BY inv.inventory_id ASC
+                """
+            ),
+            {"iid": line.item_id, "wid": header.source_warehouse_id},
+        ).fetchall()
+        for ir in inv_rows:
+            if remaining <= 0:
+                break
+            take = min(remaining, ir.quantity_on_hand)
+            if take == 0:
+                continue
+            pick_sequence += 1
+            g.db.execute(
+                text(
+                    """
+                    INSERT INTO pick_tasks
+                        (batch_id, to_id, to_line_id, item_id, bin_id,
+                         quantity_to_pick, pick_sequence, status)
+                    VALUES (:bid, :tid, :lid, :iid, :binid, :qty,
+                            :seq, 'PENDING')
+                    """
+                ),
+                {
+                    "bid": batch_id,
+                    "tid": to_id,
+                    "lid": line.to_line_id,
+                    "iid": line.item_id,
+                    "binid": ir.bin_id,
+                    "qty": take,
+                    "seq": pick_sequence,
+                },
+            )
+            remaining -= take
+            tasks_created += 1
+        if remaining > 0:
+            # Source warehouse cannot fulfil the committed quantity in
+            # any bin. The line keeps its committed_qty (the importer
+            # already validated availability) but the picker can't
+            # walk to anything; surface for operator action.
+            g.db.rollback()
+            return jsonify({
+                "error": "no_pickable_inventory",
+                "to_line_id": line.to_line_id,
+                "item_id": line.item_id,
+                "remaining": remaining,
+            }), 409
+
+    g.db.commit()
+    return jsonify({
+        "batch_id": batch_id,
+        "batch_number": batch_number,
+        "tasks_created": tasks_created,
+    }), 201
+
+
+# ============================================================
+# Picker-facing TO read endpoint (#292)
+# ============================================================
+
+
+@admin_bp.route("/picker/transfer-orders/<int:to_id>", methods=["GET"])
+@require_auth
+@with_db
+def picker_get_transfer_order(to_id):
+    """Read-only TO state for the mobile picking screen. No ADMIN
+    gate; any authenticated user with warehouse access can view."""
+    header = g.db.execute(
+        text(
+            """
+            SELECT to_id, to_number, source_warehouse_id,
+                   destination_warehouse_id, status,
+                   created_by, notes, external_id, created_at, updated_at
+              FROM transfer_orders WHERE to_id = :tid
+            """
+        ),
+        {"tid": to_id},
+    ).fetchone()
+    if not header:
+        return jsonify({"error": "Transfer order not found"}), 404
+
+    lines = g.db.execute(
+        text(
+            """
+            SELECT tol.to_line_id, tol.to_id, tol.item_id,
+                   i.sku, i.item_name,
+                   tol.line_number, tol.requested_qty, tol.committed_qty,
+                   tol.picked_qty, tol.approved_qty, tol.status
+              FROM transfer_order_lines tol
+              JOIN items i ON i.item_id = tol.item_id
+             WHERE tol.to_id = :tid
+             ORDER BY tol.line_number
+            """
+        ),
+        {"tid": to_id},
+    ).fetchall()
+
+    return jsonify({
+        "transfer_order": _serialise_to_header(header),
+        "lines": [_serialise_to_line(r) for r in lines],
+    })

@@ -300,8 +300,10 @@ def confirm_pick(db, pick_task_id, scanned_barcode, quantity_picked, username):
     task = db.execute(
         text(
             """
-            SELECT pt.pick_task_id, pt.batch_id, pt.so_id, pt.so_line_id, pt.item_id,
-                   pt.bin_id, pt.quantity_to_pick, pt.status, pt.tote_number
+            SELECT pt.pick_task_id, pt.batch_id, pt.so_id, pt.so_line_id,
+                   pt.to_id, pt.to_line_id,
+                   pt.item_id, pt.bin_id, pt.quantity_to_pick, pt.status,
+                   pt.tote_number
             FROM pick_tasks pt
             WHERE pt.pick_task_id = :tid
             """
@@ -342,35 +344,53 @@ def confirm_pick(db, pick_task_id, scanned_barcode, quantity_picked, username):
         {"qty": quantity_picked, "user": username, "tid": pick_task_id, "task_status": TASK_PICKED},
     )
 
-    # 4. Update sales_order_lines.quantity_picked (wave or standard)
-    breakdown = db.execute(
-        text("SELECT id, so_id, so_line_id, quantity FROM wave_pick_breakdown WHERE pick_task_id = :tid ORDER BY so_id"),
-        {"tid": pick_task_id},
-    ).fetchall()
+    # 4. Branch on the pick_tasks discriminator (mig 049 #281). SO
+    # picks update sales_order_lines as before; TO picks update
+    # transfer_order_lines via the picked-state-machine helper. The
+    # XOR CHECK on pick_tasks guarantees exactly one of so_id / to_id
+    # is non-NULL so the branches are mutually exclusive.
+    if task.to_id is not None:
+        # v1.8.0 (#292): TO line picked-qty + status update via the
+        # WHERE-clause guard helper. Raises OverPickAttempt when a
+        # concurrent picker has already filled the line; the route
+        # surfaces 409.
+        from services.transfer_order_service import (
+            maybe_promote_header_to_partially_picked,
+            update_transfer_order_line_picked,
+        )
+        update_transfer_order_line_picked(
+            db, task.to_line_id, quantity_picked,
+        )
+        maybe_promote_header_to_partially_picked(db, task.to_id)
+    else:
+        breakdown = db.execute(
+            text("SELECT id, so_id, so_line_id, quantity FROM wave_pick_breakdown WHERE pick_task_id = :tid ORDER BY so_id"),
+            {"tid": pick_task_id},
+        ).fetchall()
 
-    if breakdown:
-        # Wave pick - update each contributing SO line
-        for bd in breakdown:
-            db.execute(
-                text(
-                    "UPDATE wave_pick_breakdown SET quantity_picked = quantity WHERE id = :bid"
-                ),
-                {"bid": bd.id},
-            )
+        if breakdown:
+            # Wave pick - update each contributing SO line
+            for bd in breakdown:
+                db.execute(
+                    text(
+                        "UPDATE wave_pick_breakdown SET quantity_picked = quantity WHERE id = :bid"
+                    ),
+                    {"bid": bd.id},
+                )
+                db.execute(
+                    text(
+                        "UPDATE sales_order_lines SET quantity_picked = quantity_picked + :qty WHERE so_line_id = :sol_id"
+                    ),
+                    {"qty": bd.quantity, "sol_id": bd.so_line_id},
+                )
+        else:
+            # Standard pick - single SO line
             db.execute(
                 text(
                     "UPDATE sales_order_lines SET quantity_picked = quantity_picked + :qty WHERE so_line_id = :sol_id"
                 ),
-                {"qty": bd.quantity, "sol_id": bd.so_line_id},
+                {"qty": quantity_picked, "sol_id": task.so_line_id},
             )
-    else:
-        # Standard pick - single SO line
-        db.execute(
-            text(
-                "UPDATE sales_order_lines SET quantity_picked = quantity_picked + :qty WHERE so_line_id = :sol_id"
-            ),
-            {"qty": quantity_picked, "sol_id": task.so_line_id},
-        )
 
     # 5. Update inventory (floor at zero for safety)
     db.execute(
@@ -398,22 +418,45 @@ def confirm_pick(db, pick_task_id, scanned_barcode, quantity_picked, username):
         {"bid": task.batch_id},
     ).fetchone()
 
-    write_audit_log(
-        db,
-        action_type=ACTION_PICK,
-        entity_type="SO",
-        entity_id=task.so_id,
-        user_id=username,
-        warehouse_id=batch.warehouse_id,
-        details={
-            "pick_task_id": pick_task_id,
-            "item_id": task.item_id,
-            "sku": item.sku,
-            "quantity_picked": quantity_picked,
-            "bin_id": task.bin_id,
-            "batch_id": task.batch_id,
-        },
-    )
+    if task.to_id is not None:
+        # v1.8.0 (#292): TO picks log against TO_LINE entity so
+        # investigators trace back through the TO lifecycle audit
+        # chain rather than mixing with SO picks.
+        from constants import ACTION_TO_LINE_PICKED
+        write_audit_log(
+            db,
+            action_type=ACTION_TO_LINE_PICKED,
+            entity_type="TO_LINE",
+            entity_id=task.to_line_id,
+            user_id=username,
+            warehouse_id=batch.warehouse_id,
+            details={
+                "pick_task_id": pick_task_id,
+                "to_id": task.to_id,
+                "item_id": task.item_id,
+                "sku": item.sku,
+                "quantity_picked": quantity_picked,
+                "bin_id": task.bin_id,
+                "batch_id": task.batch_id,
+            },
+        )
+    else:
+        write_audit_log(
+            db,
+            action_type=ACTION_PICK,
+            entity_type="SO",
+            entity_id=task.so_id,
+            user_id=username,
+            warehouse_id=batch.warehouse_id,
+            details={
+                "pick_task_id": pick_task_id,
+                "item_id": task.item_id,
+                "sku": item.sku,
+                "quantity_picked": quantity_picked,
+                "bin_id": task.bin_id,
+                "batch_id": task.batch_id,
+            },
+        )
 
     db.commit()
 

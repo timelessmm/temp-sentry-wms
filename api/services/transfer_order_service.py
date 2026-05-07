@@ -149,3 +149,143 @@ def is_header_closeable(line_states: Iterable[tuple]) -> bool:
             continue
         return False
     return True
+
+
+# ============================================================
+# Pick-side helpers
+# ============================================================
+
+
+class OverPickAttempt(Exception):
+    """picked_qty + delta would exceed committed_qty. The WHERE clause
+    guard on update_transfer_order_line_picked is the atomic safety net
+    so two concurrent pickers can't both push past the cap; the route
+    surfaces 409 to the second picker."""
+
+
+def update_transfer_order_line_picked(db, to_line_id: int, delta: int) -> dict:
+    """Atomically bump transfer_order_lines.picked_qty by ``delta`` and
+    flip status accordingly.
+
+    No FOR UPDATE: the WHERE clause encodes the cap (picked_qty + delta
+    <= committed_qty) so two concurrent pickers serialize at the row
+    lock taken by the UPDATE itself. The second picker's UPDATE
+    returns zero rows if the first one already filled the line; the
+    helper raises OverPickAttempt and the route surfaces 409.
+
+    Returns {"picked_qty", "committed_qty", "status"} on success.
+    """
+    if delta <= 0:
+        raise ValueError(f"delta must be > 0, got {delta!r}")
+    from sqlalchemy import text  # local import to keep top of file lib-free
+
+    row = db.execute(
+        text(
+            """
+            UPDATE transfer_order_lines
+               SET picked_qty = picked_qty + :delta,
+                   status = CASE
+                       WHEN picked_qty + :delta = committed_qty
+                            THEN :picked_state
+                       ELSE :partial_state
+                   END
+             WHERE to_line_id = :lid
+               AND picked_qty + :delta <= committed_qty
+               AND status IN (:pending, :partial_state)
+             RETURNING picked_qty, committed_qty, status
+            """
+        ),
+        {
+            "delta": delta,
+            "lid": to_line_id,
+            "picked_state": TO_LINE_PICKED,
+            "partial_state": TO_LINE_PARTIALLY_PICKED,
+            "pending": TO_LINE_PENDING,
+        },
+    ).fetchone()
+    if row is None:
+        raise OverPickAttempt(
+            f"transfer_order_lines.to_line_id={to_line_id}: pick of "
+            f"+{delta} would exceed committed_qty or line is in a "
+            f"non-pickable state"
+        )
+    return {
+        "picked_qty": row.picked_qty,
+        "committed_qty": row.committed_qty,
+        "status": row.status,
+    }
+
+
+def maybe_promote_header_to_awaiting_approval(db, to_id: int) -> bool:
+    """When every TO line has reached PICKED or SHORT_CLOSED, the
+    header advances to AWAITING_APPROVAL. Called after confirm_pick
+    + after picker submission. Returns True when the header was
+    actually advanced (so the caller can write the status-flip
+    audit row), False when the TO is still mid-pick.
+    """
+    from sqlalchemy import text
+
+    counts = db.execute(
+        text(
+            """
+            SELECT
+              COUNT(*) FILTER (WHERE status IN (:pending, :partial)) AS open,
+              COUNT(*) FILTER (WHERE status = :picked) AS picked_full,
+              COUNT(*) AS total
+              FROM transfer_order_lines
+             WHERE to_id = :tid
+            """
+        ),
+        {
+            "tid": to_id,
+            "pending": TO_LINE_PENDING,
+            "partial": TO_LINE_PARTIALLY_PICKED,
+            "picked": TO_LINE_PICKED,
+        },
+    ).fetchone()
+    if counts.total == 0 or counts.open > 0 or counts.picked_full == 0:
+        return False
+    # Every line is either PICKED, APPROVED, or SHORT_CLOSED. The
+    # header should be AWAITING_APPROVAL unless it is already there or
+    # already past it (PARTIALLY_PICKED -> AWAITING_APPROVAL is the
+    # only forward transition the picker triggers).
+    header_row = db.execute(
+        text(
+            "SELECT status FROM transfer_orders WHERE to_id = :tid FOR UPDATE"
+        ),
+        {"tid": to_id},
+    ).fetchone()
+    if header_row is None or header_row.status == TO_STATUS_AWAITING_APPROVAL:
+        return False
+    if header_row.status not in (TO_STATUS_OPEN, TO_STATUS_PARTIALLY_PICKED):
+        return False
+    db.execute(
+        text(
+            "UPDATE transfer_orders "
+            "   SET status = :st, updated_at = NOW() "
+            " WHERE to_id = :tid"
+        ),
+        {"st": TO_STATUS_AWAITING_APPROVAL, "tid": to_id},
+    )
+    return True
+
+
+def maybe_promote_header_to_partially_picked(db, to_id: int) -> bool:
+    """First pick on an OPEN TO advances the header to
+    PARTIALLY_PICKED. Returns True when the row actually flipped."""
+    from sqlalchemy import text
+
+    row = db.execute(
+        text(
+            "UPDATE transfer_orders "
+            "   SET status = :new_st, updated_at = NOW() "
+            " WHERE to_id = :tid AND status = :open "
+            " RETURNING status"
+        ),
+        {
+            "tid": to_id,
+            "new_st": TO_STATUS_PARTIALLY_PICKED,
+            "open": TO_STATUS_OPEN,
+        },
+    ).fetchone()
+    return row is not None
