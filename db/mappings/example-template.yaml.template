@@ -495,13 +495,15 @@ resources:
 #    investigators can correlate which mapping doc was active when
 #    a given inbound POST was processed.
 #
-# 5. `mapping_overrides` is reserved for v1.7.1 and currently
-#    rejected. The InboundBody schema accepts a top-level
-#    `mapping_overrides` dict, but the v1.7.0 handler rejects every
-#    request that carries one with 403 feature_not_available_in_v1_7_0
-#    regardless of token capability flags. Do not include
-#    `mapping_overrides` in inbound POST bodies until v1.7.1 ships
-#    the per-request override semantics (see #270).
+# 5. `mapping_overrides` lives on the token, not the request body
+#    (v1.8.0 #270). Per-request body-level mapping_overrides is
+#    rejected with 403 mapping_overrides_not_supported_in_body. The
+#    v1.8.0 surface is per-token static config: issue a token with
+#    `mapping_override: true` and a non-empty `mapping_overrides`
+#    JSONB; the inbound handler applies the JSONB to the canonical
+#    record after the mapping doc translates the source. See
+#    docs/erp-integration.md for the operator-facing reference.
+#    Per-request body overrides (Option A) remain deferred to v1.x.
 #
 # 6. `line_items` mappings are accepted but not written to *_lines
 #    tables in v1.7.0. The mapping-loader supports `line_items:` at

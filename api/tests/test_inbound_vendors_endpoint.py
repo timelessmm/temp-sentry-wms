@@ -174,10 +174,11 @@ class TestVendorsEndpoint:
     def test_mapping_overrides_disabled_without_capability(
         self, client, app, scenario
     ):
-        """v1.7.0 (#269): mapping_overrides is disabled regardless of
-        token capability. A request that includes the field in the body
-        gets 403 feature_not_available_in_v1_7_0. No canonical / inbound
-        / audit row written."""
+        """v1.8.0 (#270): per-request body mapping_overrides is rejected
+        regardless of token capability. Per-token static config is the
+        v1.8 surface; per-request body overrides (Option A) remain
+        deferred. 403 mapping_overrides_not_supported_in_body. No
+        canonical / inbound / audit row written."""
         ss = scenario["ss"]
         _load(app, ss, _VENDORS_MAPPING.format(ss=ss))
         _insert_token_via_test_conn(ss, "vend-noov", mapping_override=False)
@@ -189,7 +190,7 @@ class TestVendorsEndpoint:
         })
         assert resp.status_code == 403
         body = resp.get_json()
-        assert body["error_kind"] == "feature_not_available_in_v1_7_0"
+        assert body["error_kind"] == "mapping_overrides_not_supported_in_body"
         assert "mapping_overrides" in body["detail"]
         assert resp.headers["X-Sentry-Canonical-Model"] == "DRAFT-v1"
 
@@ -205,11 +206,11 @@ class TestVendorsEndpoint:
     def test_mapping_overrides_disabled_even_with_capability(
         self, client, app, scenario
     ):
-        """v1.7.0 (#269): the disable applies regardless of the token's
-        mapping_override capability flag. Granting the column-level
-        capability does not re-enable the feature in v1.7.0; v1.7.1
-        will resolve the source-path-remap vs value-replacement
-        ambiguity (#270)."""
+        """v1.8.0 (#270): the body-level rejection applies even with
+        the capability flag set. Granting mapping_override on the token
+        enables per-token static overrides (mapping_overrides JSONB on
+        wms_tokens) but does NOT re-enable the per-request body shape;
+        Option A remains deferred."""
         ss = scenario["ss"]
         _load(app, ss, _VENDORS_MAPPING.format(ss=ss))
         _insert_token_via_test_conn(ss, "vend-ov", mapping_override=True)
@@ -221,7 +222,7 @@ class TestVendorsEndpoint:
         })
         assert resp.status_code == 403
         body = resp.get_json()
-        assert body["error_kind"] == "feature_not_available_in_v1_7_0"
+        assert body["error_kind"] == "mapping_overrides_not_supported_in_body"
         # No canonical, inbound, or audit row written for a rejected request.
         n_vendor = _query(
             "SELECT COUNT(*) FROM vendors WHERE external_id = (SELECT canonical_id "

@@ -140,6 +140,7 @@ def _insert_via_test_conn(ss, plaintext, **kw):
     runs (e.g., subsequent test files). Inserting via the test conn
     keeps the rows test-scoped."""
     import hashlib
+    import json as _json
     from _wms_token_helpers import PEPPER, DEFAULT_TEST_ENDPOINTS
 
     conn = db_test_context.get_raw_connection()
@@ -154,8 +155,10 @@ def _insert_via_test_conn(ss, plaintext, **kw):
         cur.execute(
             "INSERT INTO wms_tokens "
             "(token_name, token_hash, status, warehouse_ids, event_types, "
-            " endpoints, source_system, inbound_resources, mapping_override) "
-            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING token_id",
+            " endpoints, source_system, inbound_resources, mapping_override, "
+            " mapping_overrides) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb) "
+            "RETURNING token_id",
             (
                 kw.get("name", f"inbound-test-{uuid.uuid4().hex[:6]}"),
                 token_hash, "active",
@@ -165,6 +168,7 @@ def _insert_via_test_conn(ss, plaintext, **kw):
                 ss,
                 kw.get("inbound_resources", ["sales_orders"]),
                 kw.get("mapping_override", False),
+                _json.dumps(kw.get("mapping_overrides", {})),
             ),
         )
         token_id = cur.fetchone()[0]
@@ -689,3 +693,117 @@ class TestOptionalSalesOrderFields:
         assert "order_total" in body["message"]
         assert ("le=" in body["message"]
                 or "significant digit" in body["message"])
+
+
+# ----------------------------------------------------------------------
+# v1.8.0 (#270) per-token mapping_overrides applied to canonical record
+# ----------------------------------------------------------------------
+
+
+class TestPerTokenMappingOverrides:
+    def test_overrides_applied_when_capability_and_jsonb_set(
+        self, client, app, scenario,
+    ):
+        ss = _setup_basic(
+            app, scenario, "ovr-1",
+            mapping_override=True,
+            mapping_overrides={"customer_name": "OVERRIDDEN"},
+        )
+        resp = _post(client, "ovr-1", {
+            "external_id": "SO-OVR-1",
+            "external_version": "2026-05-04T10:00:00+00:00",
+            "source_payload": {
+                "orderNumber": "SO-OVR-1",
+                "warehouseId": 1,
+                "customer": {"name": "FromSource"},
+            },
+        })
+        assert resp.status_code == 201, resp.get_json()
+        scenario["canonical_external_ids"].append(resp.get_json()["canonical_id"])
+        rows = _query(
+            "SELECT customer_name FROM sales_orders WHERE external_id = %s",
+            (resp.get_json()["canonical_id"],),
+        )
+        # Per-token override wins over the source-derived value.
+        assert rows[0][0] == "OVERRIDDEN"
+
+    def test_overrides_ignored_when_capability_flag_off(
+        self, client, app, scenario,
+    ):
+        # Capability flag FALSE + JSONB populated == handler skips
+        # the override path. (Schema validation prevents this shape
+        # at admin time, but a direct-DB insert can land it; the
+        # handler's gate is the runtime safety net.)
+        ss = _setup_basic(
+            app, scenario, "ovr-2",
+            mapping_override=False,
+            mapping_overrides={"customer_name": "SHOULD_NOT_APPLY"},
+        )
+        resp = _post(client, "ovr-2", {
+            "external_id": "SO-OVR-2",
+            "external_version": "2026-05-04T10:00:00+00:00",
+            "source_payload": {
+                "orderNumber": "SO-OVR-2",
+                "warehouseId": 1,
+                "customer": {"name": "FromSource"},
+            },
+        })
+        assert resp.status_code == 201, resp.get_json()
+        scenario["canonical_external_ids"].append(resp.get_json()["canonical_id"])
+        rows = _query(
+            "SELECT customer_name FROM sales_orders WHERE external_id = %s",
+            (resp.get_json()["canonical_id"],),
+        )
+        assert rows[0][0] == "FromSource"
+
+    def test_empty_jsonb_with_capability_set_no_op(
+        self, client, app, scenario,
+    ):
+        # Capability flag TRUE + empty JSONB == no override applied.
+        # (Standard token shape for inbound tokens that opt in but
+        # haven't configured any overrides yet.)
+        ss = _setup_basic(
+            app, scenario, "ovr-3",
+            mapping_override=True,
+            mapping_overrides={},
+        )
+        resp = _post(client, "ovr-3", {
+            "external_id": "SO-OVR-3",
+            "external_version": "2026-05-04T10:00:00+00:00",
+            "source_payload": {
+                "orderNumber": "SO-OVR-3",
+                "warehouseId": 1,
+                "customer": {"name": "FromSource"},
+            },
+        })
+        assert resp.status_code == 201
+        scenario["canonical_external_ids"].append(resp.get_json()["canonical_id"])
+        rows = _query(
+            "SELECT customer_name FROM sales_orders WHERE external_id = %s",
+            (resp.get_json()["canonical_id"],),
+        )
+        assert rows[0][0] == "FromSource"
+
+    def test_body_overrides_still_rejected_403(
+        self, client, app, scenario,
+    ):
+        # Per-request body-level overrides remain rejected; only the
+        # per-token static config is honored in v1.8.
+        ss = _setup_basic(
+            app, scenario, "ovr-4",
+            mapping_override=True,
+            mapping_overrides={"customer_name": "from-token"},
+        )
+        resp = _post(client, "ovr-4", {
+            "external_id": "SO-OVR-4",
+            "external_version": "2026-05-04T10:00:00+00:00",
+            "source_payload": {
+                "orderNumber": "SO-OVR-4",
+                "warehouseId": 1,
+                "customer": {"name": "x"},
+            },
+            "mapping_overrides": {"customer_name": "from-body"},
+        })
+        assert resp.status_code == 403
+        body = resp.get_json()
+        assert body["error_kind"] == "mapping_overrides_not_supported_in_body"

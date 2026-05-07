@@ -221,29 +221,32 @@ def handle_inbound(
     """
     cfg = get_config(resource_key)
 
-    # v1.7.0 (#269): mapping_overrides is disabled until v1.7.1 resolves
-    # the source-path-remap vs canonical-value-replacement semantics
-    # ambiguity (see #270). Reject the request regardless of token
-    # capability so neither shape becomes the de-facto contract by
-    # accident. The capability column on wms_tokens stays so the v1.7.1
-    # decision lands without a migration.
-    overrides = body.get("mapping_overrides")
-    if overrides is not None:
+    # v1.8.0 (#270): mapping_overrides resolution.
+    #
+    # Per-request body-level overrides (Option A) stay rejected: the
+    # connector author cannot remap canonical fields by sneaking JSON
+    # into individual POSTs. Body-level Option A may land in v1.x if
+    # real demand surfaces; for v1.8 the surface is locked.
+    if body.get("mapping_overrides") is not None:
         return HandlerError(
             status_code=403,
             body={
-                "error_kind": "feature_not_available_in_v1_7_0",
+                "error_kind": "mapping_overrides_not_supported_in_body",
                 "detail": (
-                    "mapping_overrides is deferred to v1.7.1 pending "
-                    "semantics decision (#270)."
+                    "Per-request mapping_overrides is not supported. Issue "
+                    "a token with mapping_override=true and the desired "
+                    "mapping_overrides JSONB; per-token static overrides "
+                    "apply automatically. See docs/erp-integration.md."
                 ),
             },
         )
-    # Belt-and-braces: even with overrides=None, force the rest of the
-    # handler to behave as if the capability is absent. Future v1.7.x
-    # shouldn't accidentally reintroduce the value-replacement path
-    # without revisiting the gate.
+    # Per-token static overrides (Option B) apply only when both the
+    # capability flag is TRUE and the JSONB is non-empty. Migration 052
+    # ensures the column is NOT NULL DEFAULT '{}' so the empty-dict
+    # path is the universal default.
     overrides = None
+    if token.get("mapping_override") and token.get("mapping_overrides"):
+        overrides = token["mapping_overrides"]
 
     source_system: str = token["source_system"]
     external_id: str = body["external_id"]
