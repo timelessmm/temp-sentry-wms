@@ -8,7 +8,7 @@ from sqlalchemy import text
 from middleware.auth_middleware import require_auth, warehouse_scope_clause
 from middleware.db import with_db
 from schemas.shipping import FulfillRequest
-from services.shipping_service import record_ship
+from services.shipping_service import record_ship, require_packing_before_shipping
 from constants import SO_PICKED, SO_PACKED
 from utils.validation import validate_body
 
@@ -17,10 +17,7 @@ shipping_bp = Blueprint("shipping", __name__)
 
 def _require_packing(db):
     """Check if packing is required before shipping."""
-    row = db.execute(
-        text("SELECT value FROM app_settings WHERE key = 'require_packing_before_shipping'")
-    ).fetchone()
-    return not row or row.value != "false"
+    return require_packing_before_shipping(db)
 
 
 @shipping_bp.route("/order/<barcode>")

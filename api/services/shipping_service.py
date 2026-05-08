@@ -22,6 +22,20 @@ from constants import (
 )
 
 
+def require_packing_before_shipping(db) -> bool:
+    """True when app_settings.require_packing_before_shipping is set to
+    something OTHER than the literal string 'false'. The setting defaults
+    on (returns True when the row is absent) so a fresh install gates
+    shipping behind packing rather than letting a misconfigured deploy
+    skip the verify step. Both the cookie-auth /api/shipping/fulfill
+    and the dockd /api/v1/dockd/orders/.../ship surfaces consult this
+    helper, so the gate is consistent across surfaces."""
+    row = db.execute(
+        text("SELECT value FROM app_settings WHERE key = 'require_packing_before_shipping'")
+    ).fetchone()
+    return not row or row.value != "false"
+
+
 def record_ship(
     db,
     *,

@@ -233,6 +233,27 @@ def create_app():
                 f"[16, 4096] or unset for the 256 KB default."
             )
 
+    # v1.9.0 dockd: separate body-size cap. Dockd POST bodies are tiny
+    # (a few hundred bytes) so the default is a tighter 64 KB clamped
+    # to [16, 1024]. Same fail-loud-on-typo posture as inbound.
+    _dockd_max_body_raw = os.getenv("SENTRY_DOCKD_MAX_BODY_KB")
+    if _dockd_max_body_raw is not None and _dockd_max_body_raw.strip() != "":
+        try:
+            _dockd_max_body_kb = int(_dockd_max_body_raw)
+        except ValueError:
+            raise RuntimeError(
+                f"SENTRY_DOCKD_MAX_BODY_KB={_dockd_max_body_raw!r} is not "
+                f"an integer. Unset for the default (64), or set to a "
+                f"value in [16, 1024]."
+            )
+        if _dockd_max_body_kb < 16 or _dockd_max_body_kb > 1024:
+            raise RuntimeError(
+                f"SENTRY_DOCKD_MAX_BODY_KB={_dockd_max_body_kb} is outside "
+                f"the [16, 1024] range. A typo'd value would silently "
+                f"degrade the body-size cap; refusing to boot. Set to a "
+                f"value in [16, 1024] or unset for the 64 KB default."
+            )
+
     # v1.7.0 Pipe B: load every mapping document under
     # SENTRY_INBOUND_MAPPINGS_DIR (default /db/mappings) at boot. Cross-checks
     # against inbound_source_systems_allowlist; an allowlisted source_system
@@ -388,6 +409,7 @@ def create_app():
     from routes.snapshot import snapshot_bp
     from routes.inbound import inbound_bp
     from routes.dashboard import dashboard_bp
+    from routes.dockd import dockd_bp
 
     app.register_blueprint(auth_bp, url_prefix="/api/auth")
     app.register_blueprint(lookup_bp, url_prefix="/api/lookup")
@@ -412,6 +434,11 @@ def create_app():
     app.register_blueprint(inbound_bp, url_prefix="/api/v1/inbound")
     # v1.8.0 (#297) productivity dashboard.
     app.register_blueprint(dashboard_bp, url_prefix="/api/v1/dashboard")
+    # v1.9.0 dockd shipping surface. GET /orders/<so_number> lands in
+    # this commit; POST /ship and /void-ship arrive in subsequent ones
+    # and reuse this blueprint. Gated by @require_wms_token's V190
+    # dispatcher branch (dockd.dispatch slug, exclusive direction).
+    app.register_blueprint(dockd_bp, url_prefix="/api/v1/dockd")
 
     # Import connector modules so they auto-register with the registry
     import connectors.example  # noqa: F401
