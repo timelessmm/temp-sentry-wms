@@ -10,7 +10,10 @@ Boot validation lives in app.create_app(); the helper here trusts the
 boot guard and reads the env var on each request.
 """
 
+import hashlib
+import json
 import os
+from typing import Any, Mapping
 
 
 SENTRY_DOCKD_MAX_BODY_KB_DEFAULT = 64
@@ -27,3 +30,23 @@ def get_max_body_kb() -> int:
     refused to boot the app, so on-the-request-path we just int() it.
     """
     return int(os.getenv("SENTRY_DOCKD_MAX_BODY_KB", str(SENTRY_DOCKD_MAX_BODY_KB_DEFAULT)))
+
+
+def canonical_body_sha256(body_dict: Mapping[str, Any]) -> str:
+    """SHA-256 over the JSON serialization of a Pydantic-parsed body
+    with idempotency_key excluded and keys sorted lexicographically.
+
+    Excluding idempotency_key means a client retrying with the same key
+    can produce byte-different JSON (whitespace, key order) and still
+    get a cache hit. Including all other fields means a tracking,
+    carrier, or operator change is detected as a cache miss and surfaces
+    as 409 idempotency_key_reused_with_different_body.
+
+    The caller is expected to pass a dict that has already been through
+    ``model_dump(mode='json')``; that conversion turns Decimal / UUID /
+    datetime into JSON-compatible primitives so json.dumps does not
+    raise on the second pass.
+    """
+    payload = {k: v for k, v in body_dict.items() if k != "idempotency_key"}
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()

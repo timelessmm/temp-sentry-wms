@@ -48,6 +48,9 @@ def record_ship(
     ship_method,
     username,
     source_txn_id,
+    pre_ship_status=None,
+    shipping_cost=None,
+    audit_details_extra=None,
 ):
     """Record a ship event on an already-locked sales order.
 
@@ -60,14 +63,26 @@ def record_ship(
     Caller is responsible for the transaction commit. This function does not
     commit; it does emit one ship.confirmed/1 event onto the outbox.
 
-    Returns dict with fulfillment_id, shipped_at, lines_shipped, total_quantity.
+    v1.9.0 dockd kwargs (all optional, default behaviour matches the
+    cookie-auth /api/shipping/fulfill route):
+      - pre_ship_status: status the order was in before this ship; stored
+        on item_fulfillments.pre_ship_status so a void can revert cleanly.
+      - shipping_cost: ShipRush-returned cost, persisted on
+        item_fulfillments.shipping_cost AND mirrored into
+        audit_log.details.shipping_cost.
+      - audit_details_extra: dict merged into the audit_log.details body so
+        dockd-specific attribution (station_label, manual_link, weight,
+        dims, idempotency_key, operator_username) lands in the chained log.
+
+    Returns dict with fulfillment_id, shipped_at, lines_shipped,
+    total_quantity, audit_log_id.
     """
     # 1. Create item_fulfillments record
     result = db.execute(
         text(
             """
-            INSERT INTO item_fulfillments (so_id, warehouse_id, tracking_number, carrier, ship_method, shipped_by, status, external_id)
-            VALUES (:so_id, :wh, :tracking, :carrier, :ship_method, :shipped_by, :shipped_status, :ext_id)
+            INSERT INTO item_fulfillments (so_id, warehouse_id, tracking_number, carrier, ship_method, shipped_by, status, external_id, pre_ship_status, shipping_cost)
+            VALUES (:so_id, :wh, :tracking, :carrier, :ship_method, :shipped_by, :shipped_status, :ext_id, :pre_status, :ship_cost)
             RETURNING fulfillment_id, shipped_at
             """
         ),
@@ -80,6 +95,8 @@ def record_ship(
             "shipped_by": username,
             "shipped_status": SO_SHIPPED,
             "ext_id": str(uuid.uuid4()),
+            "pre_status": pre_ship_status,
+            "ship_cost": shipping_cost,
         },
     )
     fulfillment_row = result.fetchone()
@@ -157,19 +174,24 @@ def record_ship(
     )
 
     # 5. Audit log
-    write_audit_log(
+    audit_details = {
+        "so_number": so_number,
+        "tracking_number": tracking_number,
+        "carrier": carrier,
+        "fulfillment_id": fulfillment_id,
+    }
+    if shipping_cost is not None:
+        audit_details["shipping_cost"] = float(shipping_cost)
+    if audit_details_extra:
+        audit_details.update(audit_details_extra)
+    audit_log_id = write_audit_log(
         db,
         action_type=ACTION_SHIP,
         entity_type="SO",
         entity_id=so_id,
         user_id=username,
         warehouse_id=warehouse_id,
-        details={
-            "so_number": so_number,
-            "tracking_number": tracking_number,
-            "carrier": carrier,
-            "fulfillment_id": fulfillment_id,
-        },
+        details=audit_details,
     )
 
     # 6. v1.5.0 #118: emit ship.confirmed on the integration_events
@@ -240,4 +262,5 @@ def record_ship(
         "shipped_at": shipped_at,
         "lines_shipped": lines_shipped,
         "total_quantity": total_quantity,
+        "audit_log_id": audit_log_id,
     }

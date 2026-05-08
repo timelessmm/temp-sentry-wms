@@ -2,17 +2,17 @@
 
 Endpoints (this commit):
 
-    GET /api/v1/dockd/orders/<so_number>   -- load-on-scan order detail
+    GET  /api/v1/dockd/orders/<so_number>        -- load-on-scan
+    POST /api/v1/dockd/orders/<so_number>/ship   -- record a ship
 
-The two POST routes (ship + void-ship) land in subsequent commits.
+The remaining POST route (void-ship) lands in v1.9 #6.
 
 Per-request shape:
 - @require_wms_token: validates X-WMS-Token, refuses cross-direction
   bridging, refuses tokens without dockd.dispatch in endpoints. The
   decorator's V190 dispatcher branch is what gates this surface.
-- @limiter.limit("60 per minute") for GET; the cap exists to refuse a
-  station that's misconfigured into a tight scan loop, not to
-  constrain legitimate scan-driven UX.
+- @limiter.limit per route; replays (X-Idempotent-Replay: true) do
+  NOT count against the budget on POST routes.
 - @with_db opens the request-scoped SQLAlchemy session.
 - Every response (success and failure) carries
   X-Sentry-Canonical-Model: DRAFT-v1 so consumers can detect schema-
@@ -28,15 +28,25 @@ Path parameter validation:
 """
 
 import re
+from datetime import timezone
 
-from flask import Blueprint, g, jsonify, make_response
+from flask import Blueprint, g, jsonify, make_response, request
+from psycopg2.errors import LockNotAvailable, QueryCanceled
+from pydantic import ValidationError
 from sqlalchemy import text
+from sqlalchemy.exc import OperationalError
 
 from constants import SO_PICKED, SO_PACKED, SO_SHIPPED
 from middleware.auth_middleware import require_wms_token
 from middleware.db import with_db
+from schemas.dockd import ShipBody
+from services.dockd_service import canonical_body_sha256, get_max_body_kb
+from services.events_service import get_user_external_id
 from services.rate_limit import limiter
-from services.shipping_service import require_packing_before_shipping
+from services.shipping_service import (
+    record_ship,
+    require_packing_before_shipping,
+)
 
 
 dockd_bp = Blueprint("dockd", __name__)
@@ -216,3 +226,332 @@ def get_order(so_number):
         "station_label": None,
     }
     return _draft_response(body, 200)
+
+
+# ----------------------------------------------------------------------
+# POST /api/v1/dockd/orders/<so_number>/ship
+# ----------------------------------------------------------------------
+
+
+_SHIP_ENDPOINT = "ship"
+
+
+def _replay_response(cached_row, headers=None):
+    """Return the cached ship response with X-Idempotent-Replay: true.
+    Used both by the warm-cache short-circuit (step 0) and by the
+    racing-peer-committed branch inside the transaction."""
+    extra = {"X-Idempotent-Replay": "true"}
+    if headers:
+        extra.update(headers)
+    return _draft_response(
+        cached_row.response_body,
+        cached_row.response_status,
+        extra_headers=extra,
+    )
+
+
+@dockd_bp.route("/orders/<so_number>/ship", methods=["POST"])
+@require_wms_token
+@limiter.limit("30 per minute", exempt_when=lambda: getattr(g, "_dockd_replay_hit", False))
+@with_db
+def ship_order(so_number):
+    """Record a successful ship.
+
+    See sentry-dockd-integration-sentry-side.md ("POST /ship") for the
+    full contract. Order of operations:
+
+      0. Body-cap check + Pydantic parse + body-hash compute.
+      0a. Out-of-transaction replay short-circuit on warm cache hit.
+      1. BEGIN; SET LOCAL lock_timeout = '5s'.
+      2. Sentinel INSERT into dockd_idempotency ON CONFLICT DO NOTHING.
+         Conflict + body matches -> replay; conflict + body differs -> 409.
+      3. SELECT ... FOR UPDATE on sales_orders.
+      4. Status gate (PICKED/PACKED only, depending on packing setting).
+      5. Hand off to shipping_service.record_ship which performs the
+         shared writes (fulfillment, lines, SO update, audit, outbox).
+      6. UPDATE dockd_idempotency with response_body / response_status.
+      7. COMMIT.
+    """
+    err = _validate_so_number(so_number)
+    if err is not None:
+        return err
+
+    cap_bytes = get_max_body_kb() * 1024
+    if request.content_length is not None and request.content_length > cap_bytes:
+        return _err(
+            "body_too_large",
+            "request body exceeds SENTRY_DOCKD_MAX_BODY_KB",
+            413,
+            {"max_body_kb": get_max_body_kb()},
+        )
+
+    try:
+        body = ShipBody.model_validate(request.get_json(silent=False))
+    except ValidationError as exc:
+        first = exc.errors()[0]
+        field = ".".join(str(p) for p in first.get("loc", ()))
+        return _err(
+            "invalid_body",
+            "body failed schema validation",
+            422,
+            {"field": field, "reason": first.get("type", "value_error")},
+        )
+    except Exception:
+        return _err("invalid_body", "body is not valid JSON", 422)
+
+    body_dict = body.model_dump(mode="json")
+    body_hash = canonical_body_sha256(body_dict)
+    idempotency_key_str = body_dict["idempotency_key"]
+
+    token_id = g.current_token["token_id"]
+    token_warehouse_ids = list(g.current_token.get("warehouse_ids") or [])
+
+    # 0a. Warm-cache replay short-circuit. dockd_idempotency rows are
+    # immutable once committed; read-committed semantics are sound.
+    cached = g.db.execute(
+        text(
+            """
+            SELECT endpoint, request_body_sha256, response_body, response_status,
+                   so_number AS cached_so_number
+              FROM dockd_idempotency
+             WHERE token_id = :token_id AND idempotency_key = :key
+             LIMIT 1
+            """
+        ),
+        {"token_id": token_id, "key": idempotency_key_str},
+    ).fetchone()
+    if cached is not None:
+        if cached.endpoint != _SHIP_ENDPOINT or cached.request_body_sha256 != body_hash:
+            return _err(
+                "idempotency_key_reused_with_different_body",
+                "idempotency_key was previously used with a different body or endpoint",
+                409,
+            )
+        if cached.response_body is None:
+            # Sentinel row from a still-in-flight peer; fall through to the
+            # explicit-transaction path which will block on the ON CONFLICT
+            # path until the peer commits or aborts.
+            pass
+        else:
+            g._dockd_replay_hit = True
+            return _replay_response(cached)
+
+    # Resolve operator BEFORE the transaction so an unknown operator
+    # doesn't claim a sentinel row that then gets rolled back.
+    operator_external_id = get_user_external_id(g.db, body.operator_username)
+    if operator_external_id is None:
+        return _err(
+            "unknown_operator",
+            "operator_username does not resolve to a Sentry users row",
+            422,
+            {"field": "operator_username"},
+        )
+
+    station_label = g.current_token.get("token_name")
+
+    try:
+        g.db.execute(text("SET LOCAL lock_timeout = '5s'"))
+    except OperationalError:
+        # SQLite or a non-Postgres engine in some tests would reject
+        # SET LOCAL; the production engine is Postgres. Swallow so unit
+        # tests against an in-memory engine still work.
+        pass
+
+    try:
+        # Step 1: sentinel INSERT.
+        sentinel = g.db.execute(
+            text(
+                """
+                INSERT INTO dockd_idempotency
+                    (token_id, idempotency_key, endpoint, so_number,
+                     request_body_sha256, response_body, response_status, created_at)
+                VALUES (:token_id, :key, :endpoint, :so_number,
+                        :body_hash, NULL, NULL, NOW())
+                ON CONFLICT (token_id, idempotency_key) DO NOTHING
+                RETURNING token_id
+                """
+            ),
+            {
+                "token_id": token_id,
+                "key": idempotency_key_str,
+                "endpoint": _SHIP_ENDPOINT,
+                "so_number": so_number,
+                "body_hash": body_hash,
+            },
+        ).fetchone()
+    except OperationalError as exc:
+        # lock_timeout fires here when a concurrent transaction holds the
+        # PK constraint conflict (sentinel insert) longer than 5s.
+        if isinstance(exc.orig, (LockNotAvailable, QueryCanceled)):
+            g.db.rollback()
+            return _err(
+                "idempotency_lock_timeout",
+                "concurrent ship in flight; retry with the same key",
+                503,
+            )
+        raise
+
+    if sentinel is None:
+        # Peer committed during the wait. Re-read and replay or 409.
+        peer = g.db.execute(
+            text(
+                """
+                SELECT endpoint, request_body_sha256, response_body, response_status
+                  FROM dockd_idempotency
+                 WHERE token_id = :token_id AND idempotency_key = :key
+                """
+            ),
+            {"token_id": token_id, "key": idempotency_key_str},
+        ).fetchone()
+        g.db.commit()
+        if peer is None:
+            # Should not happen (peer aborted between our INSERT and SELECT);
+            # treat as if our INSERT had succeeded by falling through to a
+            # 503 and letting dockd retry.
+            return _err(
+                "idempotency_lock_timeout",
+                "could not claim idempotency sentinel; retry",
+                503,
+            )
+        if peer.endpoint != _SHIP_ENDPOINT or peer.request_body_sha256 != body_hash:
+            return _err(
+                "idempotency_key_reused_with_different_body",
+                "idempotency_key was previously used with a different body or endpoint",
+                409,
+            )
+        g._dockd_replay_hit = True
+        return _replay_response(peer)
+
+    # Step 2: SELECT ... FOR UPDATE on sales_orders.
+    if not token_warehouse_ids:
+        g.db.rollback()
+        return _err("not_found", "order not found", 404)
+
+    so = g.db.execute(
+        text(
+            """
+            SELECT so_id, so_number, external_id, status, warehouse_id,
+                   tracking_number, carrier, shipped_at
+              FROM sales_orders
+             WHERE so_number = :so_number
+               AND warehouse_id = ANY(:wh_ids)
+             FOR UPDATE
+            """
+        ),
+        {"so_number": so_number, "wh_ids": token_warehouse_ids},
+    ).fetchone()
+
+    if so is None:
+        g.db.rollback()
+        return _err("not_found", "order not found", 404)
+
+    # Step 3: status gate.
+    if so.status == SO_SHIPPED:
+        # Pull shipped_by from the latest fulfillment for the response.
+        ff = g.db.execute(
+            text(
+                """
+                SELECT shipped_by FROM item_fulfillments
+                 WHERE so_id = :so_id AND status = 'SHIPPED'
+                 ORDER BY shipped_at DESC NULLS LAST LIMIT 1
+                """
+            ),
+            {"so_id": so.so_id},
+        ).fetchone()
+        existing_shipped_by = ff.shipped_by if ff else None
+        g.db.rollback()
+        return _err(
+            "already_shipped",
+            "order has already been shipped",
+            409,
+            {
+                "existing_tracking": so.tracking_number,
+                "carrier": so.carrier,
+                "shipped_at": so.shipped_at.isoformat() if so.shipped_at else None,
+                "shipped_by": existing_shipped_by,
+                "station_label": None,
+            },
+        )
+
+    packing_required = require_packing_before_shipping(g.db)
+    allowed_statuses = (
+        [SO_PACKED] if packing_required else [SO_PICKED, SO_PACKED]
+    )
+    if so.status not in allowed_statuses:
+        g.db.rollback()
+        return _err(
+            "not_in_shippable_status",
+            "order is not in a shippable status",
+            410,
+            {
+                "current_status": so.status,
+                "allowed_statuses": allowed_statuses,
+            },
+        )
+
+    # Step 4: hand off to the shared shipping service. record_ship runs
+    # the fulfillment INSERT, per-line writes, SO status UPDATE, audit
+    # log write, and the ship.confirmed/1 outbox emit. source_txn_id =
+    # idempotency_key ties outbox dedup (mig 020 UNIQUE on
+    # (aggregate_type, aggregate_id, event_type, source_txn_id)) to the
+    # HTTP-level dedup so a successful retry cannot double-emit.
+    audit_extra = {
+        "station_label": station_label,
+        "manual_link": body.manual_link,
+        "idempotency_key": idempotency_key_str,
+        "operator_username": body.operator_username,
+    }
+    if body.weight is not None:
+        audit_extra["weight"] = float(body.weight)
+    if body.dims is not None:
+        audit_extra["dims"] = {
+            "l": float(body.dims.l), "w": float(body.dims.w), "h": float(body.dims.h),
+        }
+
+    result = record_ship(
+        g.db,
+        so_id=so.so_id,
+        so_number=so.so_number,
+        so_external_id=so.external_id,
+        warehouse_id=so.warehouse_id,
+        tracking_number=body.tracking,
+        carrier=body.carrier,
+        ship_method=body.ship_method,
+        username=body.operator_username,
+        source_txn_id=idempotency_key_str,
+        pre_ship_status=so.status,
+        shipping_cost=body.shipping_cost,
+        audit_details_extra=audit_extra,
+    )
+
+    response_body_dict = {
+        "status": SO_SHIPPED,
+        "tracking": body.tracking,
+        "shipped_at": result["shipped_at"].astimezone(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "fulfillment_id": result["fulfillment_id"],
+        "audit_log_id": result["audit_log_id"],
+    }
+
+    # Step 5: cache the response so a subsequent retry inside the 72h
+    # window short-circuits at step 0a.
+    import json as _json
+    g.db.execute(
+        text(
+            """
+            UPDATE dockd_idempotency
+               SET response_body = CAST(:body AS jsonb),
+                   response_status = :status
+             WHERE token_id = :token_id AND idempotency_key = :key
+            """
+        ),
+        {
+            "token_id": token_id,
+            "key": idempotency_key_str,
+            "body": _json.dumps(response_body_dict),
+            "status": 200,
+        },
+    )
+
+    g.db.commit()
+
+    return _draft_response(response_body_dict, 200)
