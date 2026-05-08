@@ -39,12 +39,13 @@ from sqlalchemy.exc import OperationalError
 from constants import SO_PICKED, SO_PACKED, SO_SHIPPED
 from middleware.auth_middleware import require_wms_token
 from middleware.db import with_db
-from schemas.dockd import ShipBody
+from schemas.dockd import ShipBody, VoidShipBody
 from services.dockd_service import canonical_body_sha256, get_max_body_kb
 from services.events_service import get_user_external_id
 from services.rate_limit import limiter
 from services.shipping_service import (
     record_ship,
+    record_void_ship,
     require_packing_before_shipping,
 )
 
@@ -534,6 +535,268 @@ def ship_order(so_number):
 
     # Step 5: cache the response so a subsequent retry inside the 72h
     # window short-circuits at step 0a.
+    import json as _json
+    g.db.execute(
+        text(
+            """
+            UPDATE dockd_idempotency
+               SET response_body = CAST(:body AS jsonb),
+                   response_status = :status
+             WHERE token_id = :token_id AND idempotency_key = :key
+            """
+        ),
+        {
+            "token_id": token_id,
+            "key": idempotency_key_str,
+            "body": _json.dumps(response_body_dict),
+            "status": 200,
+        },
+    )
+
+    g.db.commit()
+
+    return _draft_response(response_body_dict, 200)
+
+
+# ----------------------------------------------------------------------
+# POST /api/v1/dockd/orders/<so_number>/void-ship
+# ----------------------------------------------------------------------
+
+
+_VOID_ENDPOINT = "void-ship"
+
+
+@dockd_bp.route("/orders/<so_number>/void-ship", methods=["POST"])
+@require_wms_token
+@limiter.limit("10 per minute", exempt_when=lambda: getattr(g, "_dockd_replay_hit", False))
+@with_db
+def void_ship(so_number):
+    """Reverse a previously-successful ship.
+
+    Same idempotency model as POST /ship: warm-cache replay short-circuit,
+    then sentinel ON CONFLICT inside the transaction. SELECT...FOR UPDATE
+    on sales_orders, status must be SHIPPED (else 409 not_shipped). The
+    fulfillment row's pre_ship_status is the revert target; mig 054
+    backfilled it to PICKED for legacy ships and v1.9 #5's record_ship
+    populates it on every new ship, so a NULL here is a data-integrity
+    bug and surfaces as a 500 by design.
+    """
+    err = _validate_so_number(so_number)
+    if err is not None:
+        return err
+
+    cap_bytes = get_max_body_kb() * 1024
+    if request.content_length is not None and request.content_length > cap_bytes:
+        return _err(
+            "body_too_large",
+            "request body exceeds SENTRY_DOCKD_MAX_BODY_KB",
+            413,
+            {"max_body_kb": get_max_body_kb()},
+        )
+
+    try:
+        body = VoidShipBody.model_validate(request.get_json(silent=False))
+    except ValidationError as exc:
+        first = exc.errors()[0]
+        field = ".".join(str(p) for p in first.get("loc", ()))
+        return _err(
+            "invalid_body",
+            "body failed schema validation",
+            422,
+            {"field": field, "reason": first.get("type", "value_error")},
+        )
+    except Exception:
+        return _err("invalid_body", "body is not valid JSON", 422)
+
+    body_dict = body.model_dump(mode="json")
+    body_hash = canonical_body_sha256(body_dict)
+    idempotency_key_str = body_dict["idempotency_key"]
+
+    token_id = g.current_token["token_id"]
+    token_warehouse_ids = list(g.current_token.get("warehouse_ids") or [])
+
+    # Warm-cache replay short-circuit.
+    cached = g.db.execute(
+        text(
+            """
+            SELECT endpoint, request_body_sha256, response_body, response_status
+              FROM dockd_idempotency
+             WHERE token_id = :token_id AND idempotency_key = :key
+             LIMIT 1
+            """
+        ),
+        {"token_id": token_id, "key": idempotency_key_str},
+    ).fetchone()
+    if cached is not None:
+        if cached.endpoint != _VOID_ENDPOINT or cached.request_body_sha256 != body_hash:
+            return _err(
+                "idempotency_key_reused_with_different_body",
+                "idempotency_key was previously used with a different body or endpoint",
+                409,
+            )
+        if cached.response_body is not None:
+            g._dockd_replay_hit = True
+            return _replay_response(cached)
+
+    operator_external_id = get_user_external_id(g.db, body.operator_username)
+    if operator_external_id is None:
+        return _err(
+            "unknown_operator",
+            "operator_username does not resolve to a Sentry users row",
+            422,
+            {"field": "operator_username"},
+        )
+
+    station_label = g.current_token.get("token_name")
+
+    try:
+        g.db.execute(text("SET LOCAL lock_timeout = '5s'"))
+    except OperationalError:
+        pass
+
+    try:
+        sentinel = g.db.execute(
+            text(
+                """
+                INSERT INTO dockd_idempotency
+                    (token_id, idempotency_key, endpoint, so_number,
+                     request_body_sha256, response_body, response_status, created_at)
+                VALUES (:token_id, :key, :endpoint, :so_number,
+                        :body_hash, NULL, NULL, NOW())
+                ON CONFLICT (token_id, idempotency_key) DO NOTHING
+                RETURNING token_id
+                """
+            ),
+            {
+                "token_id": token_id,
+                "key": idempotency_key_str,
+                "endpoint": _VOID_ENDPOINT,
+                "so_number": so_number,
+                "body_hash": body_hash,
+            },
+        ).fetchone()
+    except OperationalError as exc:
+        if isinstance(exc.orig, (LockNotAvailable, QueryCanceled)):
+            g.db.rollback()
+            return _err(
+                "idempotency_lock_timeout",
+                "concurrent void in flight; retry with the same key",
+                503,
+            )
+        raise
+
+    if sentinel is None:
+        peer = g.db.execute(
+            text(
+                """
+                SELECT endpoint, request_body_sha256, response_body, response_status
+                  FROM dockd_idempotency
+                 WHERE token_id = :token_id AND idempotency_key = :key
+                """
+            ),
+            {"token_id": token_id, "key": idempotency_key_str},
+        ).fetchone()
+        g.db.commit()
+        if peer is None:
+            return _err(
+                "idempotency_lock_timeout",
+                "could not claim idempotency sentinel; retry",
+                503,
+            )
+        if peer.endpoint != _VOID_ENDPOINT or peer.request_body_sha256 != body_hash:
+            return _err(
+                "idempotency_key_reused_with_different_body",
+                "idempotency_key was previously used with a different body or endpoint",
+                409,
+            )
+        g._dockd_replay_hit = True
+        return _replay_response(peer)
+
+    if not token_warehouse_ids:
+        g.db.rollback()
+        return _err("not_found", "order not found", 404)
+
+    so = g.db.execute(
+        text(
+            """
+            SELECT so_id, so_number, external_id, status, warehouse_id
+              FROM sales_orders
+             WHERE so_number = :so_number
+               AND warehouse_id = ANY(:wh_ids)
+             FOR UPDATE
+            """
+        ),
+        {"so_number": so_number, "wh_ids": token_warehouse_ids},
+    ).fetchone()
+
+    if so is None:
+        g.db.rollback()
+        return _err("not_found", "order not found", 404)
+
+    if so.status != SO_SHIPPED:
+        g.db.rollback()
+        return _err(
+            "not_shipped",
+            "order is not in SHIPPED status; cannot void",
+            409,
+            {"current_status": so.status},
+        )
+
+    # Pick the SHIPPED fulfillment to void. Sentry creates one fulfillment
+    # per SO today; if a future split-shipment lands, this query keeps the
+    # latest-by-shipped_at semantic.
+    ff = g.db.execute(
+        text(
+            """
+            SELECT fulfillment_id, pre_ship_status
+              FROM item_fulfillments
+             WHERE so_id = :so_id AND status = 'SHIPPED'
+             ORDER BY shipped_at DESC NULLS LAST, fulfillment_id DESC
+             LIMIT 1
+            """
+        ),
+        {"so_id": so.so_id},
+    ).fetchone()
+
+    if ff is None:
+        # Defensive: SO claims SHIPPED but no SHIPPED fulfillment row.
+        # Treat as a data-integrity surprise; rollback and surface a
+        # generic 409 so dockd does not retry blindly.
+        g.db.rollback()
+        return _err(
+            "not_shipped",
+            "no SHIPPED fulfillment found for this order",
+            409,
+            {"current_status": so.status},
+        )
+
+    audit_extra = {
+        "station_label": station_label,
+        "idempotency_key": idempotency_key_str,
+        "operator_username": body.operator_username,
+    }
+
+    result = record_void_ship(
+        g.db,
+        so_id=so.so_id,
+        so_number=so.so_number,
+        so_external_id=so.external_id,
+        warehouse_id=so.warehouse_id,
+        fulfillment_id=ff.fulfillment_id,
+        pre_ship_status=ff.pre_ship_status,
+        operator_username=body.operator_username,
+        operator_external_id=operator_external_id,
+        reason=body.reason,
+        source_txn_id=idempotency_key_str,
+        audit_details_extra=audit_extra,
+    )
+
+    response_body_dict = {
+        "status": result["reverted_to_status"],
+        "voided_at": result["voided_at"].astimezone(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "audit_log_id": result["audit_log_id"],
+    }
+
     import json as _json
     g.db.execute(
         text(

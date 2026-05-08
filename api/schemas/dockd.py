@@ -54,3 +54,19 @@ class ShipBody(BaseModel):
     dims: Optional[Dimensions] = None
     manual_link: bool = False
     idempotency_key: UUID4
+
+
+class VoidShipBody(BaseModel):
+    """POST /api/v1/dockd/orders/<so_number>/void-ship body.
+
+    Body is intentionally minimal: the void route reverts a previously-
+    successful ship. The operator typed a free-text reason in the dockd
+    UI ("wrong box dimensions", "label printed but never applied",
+    etc.); the cap matches item_fulfillments.void_reason VARCHAR(500).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    reason: str = Field(..., min_length=1, max_length=_VOID_REASON_MAX)
+    operator_username: str = Field(..., min_length=1, max_length=_USERNAME_MAX)
+    idempotency_key: UUID4

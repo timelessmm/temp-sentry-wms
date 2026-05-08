@@ -17,6 +17,7 @@ from services.events_service import emit_event, get_user_external_id
 from constants import (
     SO_SHIPPED,
     ACTION_SHIP,
+    ACTION_SHIP_VOID,
     TASK_PICKED,
     TASK_SHORT,
 )
@@ -263,4 +264,135 @@ def record_ship(
         "lines_shipped": lines_shipped,
         "total_quantity": total_quantity,
         "audit_log_id": audit_log_id,
+    }
+
+
+def record_void_ship(
+    db,
+    *,
+    so_id,
+    so_number,
+    so_external_id,
+    warehouse_id,
+    fulfillment_id,
+    pre_ship_status,
+    operator_username,
+    operator_external_id,
+    reason,
+    source_txn_id,
+    audit_details_extra=None,
+):
+    """Reverse a previously-successful ship on an already-locked sales order.
+
+    Caller MUST have:
+      - SELECTed the sales_orders row FOR UPDATE
+      - Validated SO.status == SHIPPED
+      - Resolved operator_external_id (the ship.voided/1 schema requires
+        a UUID); 422 unknown_operator is the caller's job.
+      - Picked the SHIPPED item_fulfillments row whose pre_ship_status
+        is the revert target.
+
+    Caller is responsible for the transaction commit. This function does
+    not commit; it does emit one ship.voided/1 event onto the outbox.
+
+    Returns dict with voided_at, audit_log_id, reverted_to_status.
+    """
+    # 1. Revert the SO to its pre-ship status; clear the per-ship fields
+    # the cookie-auth or dockd record_ship populated.
+    db.execute(
+        text(
+            """
+            UPDATE sales_orders
+               SET status          = :pre,
+                   tracking_number = NULL,
+                   carrier         = NULL,
+                   shipped_at      = NULL
+             WHERE so_id = :so_id
+            """
+        ),
+        {"pre": pre_ship_status, "so_id": so_id},
+    )
+
+    # 2. Mark the fulfillment VOIDED with operator + reason + timestamp.
+    voided_row = db.execute(
+        text(
+            """
+            UPDATE item_fulfillments
+               SET status      = 'VOIDED',
+                   voided_at   = NOW(),
+                   voided_by   = :user,
+                   void_reason = :reason
+             WHERE fulfillment_id = :fid
+             RETURNING voided_at
+            """
+        ),
+        {"user": operator_username, "reason": reason, "fid": fulfillment_id},
+    ).fetchone()
+    voided_at = voided_row.voided_at
+
+    # 3. Roll back per-line state so sales_order_lines stays consistent
+    # with sales_orders.status. record_ship sets quantity_shipped =
+    # quantity_picked and status = 'SHIPPED' on every picked line; void
+    # reverses that so a re-ship through record_ship is idempotent.
+    db.execute(
+        text(
+            """
+            UPDATE sales_order_lines
+               SET quantity_shipped = 0,
+                   status           = :pre
+             WHERE so_id = :so_id
+            """
+        ),
+        {"pre": pre_ship_status, "so_id": so_id},
+    )
+
+    # 4. Audit log. Captures the original tracking/carrier indirectly via
+    # the fulfillment_id pointer; the operator-supplied reason and the
+    # revert target make the audit row self-describing.
+    audit_details = {
+        "so_number": so_number,
+        "fulfillment_id": fulfillment_id,
+        "reason": reason,
+        "reverted_to_status": pre_ship_status,
+    }
+    if audit_details_extra:
+        audit_details.update(audit_details_extra)
+    audit_log_id = write_audit_log(
+        db,
+        action_type=ACTION_SHIP_VOID,
+        entity_type="SO",
+        entity_id=so_id,
+        user_id=operator_username,
+        warehouse_id=warehouse_id,
+        details=audit_details,
+    )
+
+    # 5. Emit ship.voided/1. source_txn_id = idempotency_key ties outbox-
+    # level dedup (mig 020 UNIQUE on aggregate_type, aggregate_id,
+    # event_type, source_txn_id) to HTTP-level dedup so a successful
+    # retry cannot double-emit. The schema requires
+    # voided_by_user_external_id as UUID4 -- the caller has already
+    # resolved it (route returns 422 unknown_operator otherwise).
+    emit_event(
+        db,
+        event_type="ship.voided",
+        event_version=1,
+        aggregate_type="sales_order",
+        aggregate_id=so_id,
+        aggregate_external_id=so_external_id,
+        warehouse_id=warehouse_id,
+        source_txn_id=source_txn_id,
+        payload={
+            "sales_order_external_id": str(so_external_id),
+            "voided_at": voided_at.astimezone(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "voided_by_user_external_id": str(operator_external_id),
+            "reason": reason,
+            "reverted_to_status": pre_ship_status,
+        },
+    )
+
+    return {
+        "voided_at": voided_at,
+        "audit_log_id": audit_log_id,
+        "reverted_to_status": pre_ship_status,
     }
