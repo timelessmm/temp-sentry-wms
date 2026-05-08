@@ -375,7 +375,12 @@ CREATE TABLE item_fulfillments (
     status VARCHAR(20) DEFAULT 'SHIPPED',
     shipped_by VARCHAR(100),
     shipped_at TIMESTAMPTZ DEFAULT NOW(),
-    external_id UUID UNIQUE NOT NULL
+    external_id UUID UNIQUE NOT NULL,
+    pre_ship_status VARCHAR(20),
+    voided_at TIMESTAMPTZ,
+    voided_by VARCHAR(100),
+    void_reason VARCHAR(500),
+    shipping_cost NUMERIC(12,2)
 );
 
 CREATE TABLE item_fulfillment_lines (
@@ -1865,3 +1870,27 @@ CREATE TABLE user_dashboard_preferences (
                        CHECK (default_view IN ('charts','table')),
     updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+-- ============================================================
+-- DOCKD IDEMPOTENCY (v1.9.0)
+-- ============================================================
+-- HTTP-layer idempotency cache for the /api/v1/dockd/* surface.
+-- Sentinel-row INSERT...ON CONFLICT pattern: row inserted at the
+-- start of the request transaction with NULL response_body /
+-- response_status; populated before commit. 72h TTL pruned daily
+-- by jobs.cleanup_tasks.cleanup_dockd_idempotency. Identical DDL
+-- lives in db/migrations/054_dockd_integration.sql.
+
+CREATE TABLE dockd_idempotency (
+    token_id            BIGINT       NOT NULL REFERENCES wms_tokens(token_id) ON DELETE CASCADE,
+    idempotency_key     VARCHAR(64)  NOT NULL,
+    endpoint            VARCHAR(50)  NOT NULL,
+    so_number           VARCHAR(128) NOT NULL,
+    request_body_sha256 CHAR(64)     NOT NULL,
+    response_body       JSONB,
+    response_status     SMALLINT,
+    created_at          TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (token_id, idempotency_key)
+);
+
+CREATE INDEX dockd_idempotency_prune ON dockd_idempotency(created_at);
