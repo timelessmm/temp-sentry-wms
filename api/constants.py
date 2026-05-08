@@ -52,6 +52,9 @@ ACTION_PUTAWAY = "PUTAWAY"
 ACTION_PICK = "PICK"
 ACTION_PACK = "PACK"
 ACTION_SHIP = "SHIP"
+# v1.9.0 dockd: void of a previously-shipped order. Reverts the SO and
+# the matching item_fulfillment row to pre_ship_status (PICKED or PACKED).
+ACTION_SHIP_VOID = "SHIP_VOID"
 ACTION_TRANSFER = "TRANSFER"
 ACTION_ADJUST = "ADJUST"
 ACTION_COUNT = "COUNT"
