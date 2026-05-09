@@ -8,7 +8,7 @@ All notable changes to Sentry WMS will be documented in this file.
 
 In parallel, the SO lifecycle gains `CANCELLED` status with end-to-end wiring (admin + inbound + dashboard counter), a new `sales_orders.memo` column inbound-mappable from connector and rendered through the picker / packer / shipper flows, several mobile and admin polish fixes, and a UI modernization of the Audit Log page.
 
-**Mobile.** v1.5.1 APK stays a working baseline for backend-only deployments. The v1.9 mobile build adds a memo block on Pack / Pack-Ship / Ship screens and fixes the pack-after-short-pick fallback bug (PackScreen and PackShipScreen used `||` against `quantity_picked`, falling back to `quantity_ordered` even on a fully-shorted line and blocking pack completion -- now uses `??` so a shorted pick of 0 stays 0). **Update to the v1.9 APK if you ship from the mobile flow.**
+**Mobile.** v1.8 APK (`sentry-wms-v1.8.0.apk`) stays a working baseline: v1.9 backend changes are additive and v1.8 keeps picking + packing + receiving + putaway against a v1.9.0 backend. The v1.9 mobile build adds a memo block on Pack / Pack-Ship / Ship screens (warning-tinted callout above the scan input) and fixes the pack-after-short-pick fallback bug (`PackScreen` and `PackShipScreen` used `||` against `quantity_picked`, falling back to `quantity_ordered` even on a fully-shorted line and blocking pack completion -- now uses `??` so a shorted pick of 0 stays 0). **Update to the v1.9 APK linked on the release page if you ship from the mobile flow or want the new memo display, or stay on v1.8 if you don't.** APK build attaches to the release shortly after tagging.
 
 ### Added -- Dockd integration
 

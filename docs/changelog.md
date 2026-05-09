@@ -34,13 +34,19 @@ Two migrations (054-055). Migration 054 adds five void columns to
 `item_fulfillments` and the `dockd_idempotency` table; 055 adds
 `sales_orders.memo TEXT`. Both forward-only.
 
-**Mobile.** No v1.9 APK is published. The v1.5.1 APK
-([`sentry-wms-v1.5.1.apk`](https://github.com/hightower-systems/sentry-wms/releases/tag/v1.5.1))
-or v1.8 APK remain the recommended baselines; v1.9 backend changes are
-additive and earlier APKs keep picking + packing + receiving + putaway
-against a v1.9.0 backend. The v1.9 mobile sources include a memo block
-on Pack / Pack-Ship / Ship and a fix for the pack-after-short-pick
-fallback bug -- those will package into the next APK build.
+**Mobile.** The v1.8 APK
+([`sentry-wms-v1.8.0.apk`](https://github.com/hightower-systems/sentry-wms/releases/tag/v1.8.0))
+stays a working baseline -- v1.9 backend changes are additive and v1.8
+keeps picking + packing + receiving + putaway against a v1.9.0 backend.
+The v1.9 mobile build adds a memo block on Pack / Pack-Ship / Ship
+screens (warning-tinted callout above the scan input) and fixes a
+pack-after-short-pick fallback bug where `PackScreen` and
+`PackShipScreen` used `||` against `quantity_picked`, falling back to
+`quantity_ordered` on a fully-shorted line and blocking pack
+completion. **Update to the v1.9 APK on the
+[release page](https://github.com/hightower-systems/sentry-wms/releases/tag/v1.9.0)
+if you ship from the mobile flow or want the memo display, or stay on
+v1.8 if you don't.**
 
 ## v1.8.0 -- Transfer Orders + Productivity Dashboard
 
