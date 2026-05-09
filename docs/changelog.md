@@ -6,6 +6,42 @@ is a shorter, docs-site-friendly summary.
 
 ---
 
+## v1.9.0 -- Dockd shipping integration
+
+*2026-05-09.* [Full notes](https://github.com/hightower-systems/sentry-wms/releases/tag/v1.9.0).
+
+Sentry now serves a dedicated outbound shipping API for the in-warehouse
+dockd application. Three endpoints under
+`/api/v1/dockd/orders/<so_number>` (GET, ship, void-ship) authenticate
+via per-station bearer tokens with the new `dockd.dispatch` scope, are
+idempotent under retry through SHA-256 body-hash sentinel rows, and
+serialize concurrent ship attempts on the same SO with
+`SELECT ... FOR UPDATE`. Both ship and void-ship write through the
+existing audit-log hash chain and emit on the `integration_events`
+outbox so downstream ERPs see a fully-shipped or fully-reversed order.
+
+In parallel, the SO lifecycle gains `CANCELLED` status with end-to-end
+wiring (admin + inbound + dashboard counter); a new `sales_orders.memo`
+column inbound-mappable from connector and rendered through the picker,
+packer, and shipper flows; and a UI modernization of the Audit Log page
+with color-coded action badges, chip-style detail previews, an
+action-type select filter, and a Copy JSON button on the detail modal.
+Audit details for PICK / TO_LINE_PICKED / PACK / RECEIVE actions now
+record both expected and actual counts so investigators can reconstruct
+cumulative state from one row.
+
+Two migrations (054-055). Migration 054 adds five void columns to
+`item_fulfillments` and the `dockd_idempotency` table; 055 adds
+`sales_orders.memo TEXT`. Both forward-only.
+
+**Mobile.** No v1.9 APK is published. The v1.5.1 APK
+([`sentry-wms-v1.5.1.apk`](https://github.com/hightower-systems/sentry-wms/releases/tag/v1.5.1))
+or v1.8 APK remain the recommended baselines; v1.9 backend changes are
+additive and earlier APKs keep picking + packing + receiving + putaway
+against a v1.9.0 backend. The v1.9 mobile sources include a memo block
+on Pack / Pack-Ship / Ship and a fix for the pack-after-short-pick
+fallback bug -- those will package into the next APK build.
+
 ## v1.8.0 -- Transfer Orders + Productivity Dashboard
 
 *2026-05-07.* [Full notes](https://github.com/hightower-systems/sentry-wms/releases/tag/v1.8.0).
