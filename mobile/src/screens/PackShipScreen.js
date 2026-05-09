@@ -35,7 +35,8 @@ export default function PackShipScreen({ navigation }) {
       (item) => item.sku === barcode || item.upc === barcode || item.item_barcode === barcode
     );
     if (matchedItem) {
-      const expected = matchedItem.quantity_picked || matchedItem.quantity_ordered;
+      // v1.9.0: see PackScreen.js for the short-pick rationale.
+      const expected = matchedItem.quantity_picked ?? matchedItem.quantity_ordered;
       if ((matchedItem.verified || 0) >= expected) {
         showError(`${matchedItem.sku} already fully verified`);
         return;
@@ -60,7 +61,7 @@ export default function PackShipScreen({ navigation }) {
   };
 
   const allVerified = items.length > 0 && items.every(
-    (item) => (item.verified || 0) >= (item.quantity_picked || item.quantity_ordered)
+    (item) => (item.verified || 0) >= (item.quantity_picked ?? item.quantity_ordered)
   );
 
   const handleCompletePack = async () => {
@@ -117,7 +118,7 @@ export default function PackShipScreen({ navigation }) {
             <ScanInput placeholder="SCAN ITEM" onScan={handleScanItem} disabled={scanDisabled} />
 
             {items.map((item, idx) => {
-              const expected = item.quantity_picked || item.quantity_ordered;
+              const expected = item.quantity_picked ?? item.quantity_ordered;
               const done = item.verified || 0;
               const complete = done >= expected;
               return (

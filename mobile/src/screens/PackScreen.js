@@ -49,7 +49,16 @@ export default function PackScreen({ navigation, route }) {
       (item) => item.sku === barcode || item.upc === barcode || item.item_barcode === barcode
     );
     if (matchedItem) {
-      const expected = matchedItem.quantity_picked || matchedItem.quantity_ordered;
+      // v1.9.0: pack against quantity_picked, not quantity_ordered. A
+      // short-picked line has quantity_picked < quantity_ordered (e.g.,
+      // 3 of 5 actually picked); the operator only has those 3 items
+      // physically, so they verify against 3, not 5. The previous
+      // `||` fallback fired on a 0-picked (fully shorted) line and
+      // demanded quantity_ordered verifications the operator could
+      // never produce. Nullish coalescing keeps the fallback for
+      // genuinely-undefined fields (legacy responses) while accepting
+      // 0 as the real picked count.
+      const expected = matchedItem.quantity_picked ?? matchedItem.quantity_ordered;
       if ((matchedItem.verified || 0) >= expected) {
         showError(`${matchedItem.sku} already fully verified`);
         return;
@@ -76,7 +85,7 @@ export default function PackScreen({ navigation, route }) {
 
   const allVerified =
     items.length > 0 &&
-    items.every((item) => (item.verified || 0) >= (item.quantity_picked || item.quantity_ordered));
+    items.every((item) => (item.verified || 0) >= (item.quantity_picked ?? item.quantity_ordered));
 
   const handleCompletePack = async () => {
     try {
@@ -124,7 +133,7 @@ export default function PackScreen({ navigation, route }) {
             <ScanInput placeholder="SCAN ITEM" onScan={handleScanItem} disabled={scanDisabled} />
 
             {items.map((item, idx) => {
-              const expected = item.quantity_picked || item.quantity_ordered;
+              const expected = item.quantity_picked ?? item.quantity_ordered;
               const done = item.verified || 0;
               const complete = done >= expected;
               return (
