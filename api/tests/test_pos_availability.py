@@ -75,22 +75,6 @@ def pos_token_other_warehouse(seed_data):
     delete_token(token_id)
 
 
-@pytest.fixture()
-def pos_token_no_warehouses(seed_data):
-    plaintext = f"pos-test-empty-{uuid.uuid4()}"
-    token_id = insert_token(
-        name="POS Empty Scope",
-        plaintext=plaintext,
-        warehouse_ids=[],
-        event_types=[],
-        inbound_resources=[],
-        source_system=None,
-        endpoints=["pos.dispatch"],
-    )
-    yield {"plaintext": plaintext, "token_id": token_id}
-    delete_token(token_id)
-
-
 def _insert_warehouse(code, name):
     conn = get_raw_connection()
     cur = conn.cursor()
@@ -400,7 +384,10 @@ class TestWarehouseScope:
         self, client, pos_token_other_warehouse
     ):
         """TST-001 has stock in warehouse 1; a token scoped to
-        warehouse 99 sees the same 404 as a genuinely missing SKU."""
+        warehouse 99 sees the same 404 as a genuinely missing SKU.
+        This is the dual-query conflation: the in-scope SELECT is
+        empty, the out-of-scope leak probe finds qty>0, so the
+        response collapses to 404."""
         resp = client.get(
             "/api/v1/pos/availability?sku=TST-001",
             headers={"X-WMS-Token": pos_token_other_warehouse["plaintext"]},
@@ -409,14 +396,44 @@ class TestWarehouseScope:
         body = resp.get_json()
         assert body["error_kind"] == "item_not_found"
 
-    def test_token_with_no_warehouses_in_scope_returns_404(
-        self, client, pos_token_no_warehouses
+    def test_out_of_scope_stock_returns_404_not_empty_array(
+        self, client, seed_data
     ):
-        resp = client.get(
-            "/api/v1/pos/availability?sku=TST-001",
-            headers={"X-WMS-Token": pos_token_no_warehouses["plaintext"]},
+        """Regression test for the bug shipped in #322 and fixed in
+        #323. A SKU with available stock only in out-of-scope
+        warehouses must return 404, not 200 with availability: [].
+        The empty-array shape is reserved for "genuinely out of stock
+        everywhere"; the 404 prevents a token from inferring sister-
+        warehouse membership."""
+        wh_a = _insert_warehouse(f"a-{uuid.uuid4().hex[:6]}", "Warehouse A")
+        wh_b = _insert_warehouse(f"b-{uuid.uuid4().hex[:6]}", "Warehouse B")
+        bin_a = _insert_bin(wh_a, f"BA-{uuid.uuid4().hex[:6]}")
+        sku = f"OOS-{uuid.uuid4().hex[:6]}"
+        item_id = _insert_item(sku=sku)
+        # Stock exists in warehouse A only.
+        _insert_inventory(item_id, bin_a, wh_a, on_hand=10, allocated=0)
+
+        # Token scoped to warehouse B sees nothing in scope but the
+        # leak probe finds qty>0 in A.
+        plaintext = f"oos-token-{uuid.uuid4()}"
+        token_id = insert_token(
+            plaintext=plaintext,
+            warehouse_ids=[wh_b],
+            event_types=[],
+            inbound_resources=[],
+            source_system=None,
+            endpoints=["pos.dispatch"],
         )
-        assert resp.status_code == 404
+        try:
+            resp = client.get(
+                f"/api/v1/pos/availability?sku={sku}",
+                headers={"X-WMS-Token": plaintext},
+            )
+            assert resp.status_code == 404
+            body = resp.get_json()
+            assert body["error_kind"] == "item_not_found"
+        finally:
+            delete_token(token_id)
 
 
 # ----------------------------------------------------------------------

@@ -191,6 +191,29 @@ def availability():
         {"item_id": item.item_id, "wh_ids": token_warehouse_ids},
     ).fetchall()
 
+    # In-scope produced no available stock. Distinguish "genuinely out
+    # of stock everywhere" (return 200 [] so the POS Service can show
+    # 'out of stock') from "stock only in warehouses outside the token
+    # scope" (return 404 to prevent the token from inferring sister-
+    # warehouse membership). A single LIMIT 1 probe is enough; we just
+    # need to know whether ANY out-of-scope row holds available qty.
+    if not rows:
+        leak = g.db.execute(
+            text(
+                """
+                SELECT 1
+                  FROM inventory inv
+                 WHERE inv.item_id      = :item_id
+                   AND inv.warehouse_id != ALL(:wh_ids)
+                   AND (inv.quantity_on_hand - inv.quantity_allocated) > 0
+                 LIMIT 1
+                """
+            ),
+            {"item_id": item.item_id, "wh_ids": token_warehouse_ids},
+        ).fetchone()
+        if leak is not None:
+            return _err("item_not_found", "no item matches the given identifier", 404)
+
     # Group by warehouse. Rows are pre-ordered by warehouse_code so a
     # single pass is enough.
     availability_by_warehouse = []
