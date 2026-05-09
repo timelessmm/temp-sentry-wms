@@ -104,3 +104,34 @@ when reconstructing operator activity.
 
 Regression coverage in
 `api/tests/test_inbound_source_systems_allowlist_truncate.py`.
+
+## Action constants and detail keys (v1.9.0)
+
+Two new action constants land in v1.9.0:
+
+- `ACTION_SHIP_VOID` -- a previously-shipped SO is reversed by a dockd
+  POST `/void-ship`. Reverts the SO to `pre_ship_status` (PICKED or
+  PACKED), reverses the matching `item_fulfillments` row, rolls back
+  `sales_order_lines.quantity_shipped`. Emits `ship.voided/1` on the
+  outbox.
+- `ACTION_CANCEL` -- an SO is cancelled either by an admin or by an
+  inbound source-system update detected as a cancel intent. Pre-PICK
+  releases allocation; PICKED / PACKED reverts allocated and packed
+  counters and returns inventory to the default receiving bin. Both
+  surfaces delegate to `services.sales_order_service.cancel_sales_order`
+  so the audit row shape is identical.
+
+PICK / TO_LINE_PICKED / PACK / RECEIVE detail JSONB shapes gain
+expected-vs-actual counters so an investigator can read cumulative
+state from one row without joining upstream tables:
+
+- PICK + TO_LINE_PICKED happy path: `quantity_to_pick` alongside
+  `quantity_picked` (matches the keys SHORT_PICK already wrote).
+- PACK: `total_expected` + `total_packed` alongside the existing
+  `total_items` (preserved for any current consumer).
+- RECEIVE: `quantity_ordered` + `quantity_received_before` alongside
+  the existing `quantity` so ordered / previously-received / this-txn
+  is reconstructable from one row.
+
+Hash chain unaffected; only the JSONB payload shape changes. Older
+rows keep their pre-v1.9 shape.
