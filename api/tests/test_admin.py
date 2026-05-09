@@ -410,14 +410,21 @@ class TestSalesOrders:
         resp = client.post("/api/admin/sales-orders/1/cancel", headers=auth_headers)
         assert resp.status_code == 400
 
-    def test_cancel_already_cancelled_fails(self, client, auth_headers):
-        """Issue #90: admin UI only shows the Cancel button for OPEN SOs,
-        but guard the backend against a double-cancel anyway (the status
-        check rejects a CANCELLED order with 400)."""
+    def test_cancel_already_cancelled_is_idempotent(self, client, auth_headers):
+        """v1.9.0: cancel is idempotent on already-CANCELLED. The shared
+        cancel service treats a re-issue as a no-op (no second audit row,
+        no second inventory unwind) and returns 200 with pre_status =
+        'CANCELLED' so the caller can detect the idempotent path. ERP-
+        driven retries via the inbound surface depend on this; the admin
+        path inherits the same contract for consistency."""
         client.post("/api/admin/sales-orders/1/cancel", headers=auth_headers)
         resp = client.post("/api/admin/sales-orders/1/cancel", headers=auth_headers)
-        assert resp.status_code == 400
-        assert "Can only cancel" in resp.get_json()["error"]
+        assert resp.status_code == 200
+        body = resp.get_json()
+        assert body["pre_status"] == "CANCELLED"
+        # audit_log_id is None on the idempotent re-cancel; the original
+        # cancel's audit row remains the single source of record.
+        assert body["audit_log_id"] is None
 
 
 # ── Users ─────────────────────────────────────────────────────────────────────
@@ -756,6 +763,26 @@ class TestDashboard:
         assert "ready_to_pack" in data
         assert "orders_packed" in data
         assert "ready_to_ship" in data
+        # v1.9.0 #311: cancelled count is always present.
+        assert "cancelled_orders" in data
+        assert data["cancelled_orders"] >= 0
+
+    def test_dashboard_cancelled_count_increments_on_cancel(
+        self, client, auth_headers
+    ):
+        """v1.9.0: a cancel via the admin path bumps the dashboard's
+        cancelled_orders count by one."""
+        before = client.get(
+            "/api/admin/dashboard?warehouse_id=1", headers=auth_headers,
+        ).get_json()["cancelled_orders"]
+        resp = client.post(
+            "/api/admin/sales-orders/1/cancel", headers=auth_headers,
+        )
+        assert resp.status_code == 200
+        after = client.get(
+            "/api/admin/dashboard?warehouse_id=1", headers=auth_headers,
+        ).get_json()["cancelled_orders"]
+        assert after == before + 1
 
     def test_dashboard_without_warehouse_filter(self, client, auth_headers):
         resp = client.get("/api/admin/dashboard", headers=auth_headers)
