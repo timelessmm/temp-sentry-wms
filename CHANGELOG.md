@@ -2,6 +2,54 @@
 
 All notable changes to Sentry WMS will be documented in this file.
 
+## [v1.9.0] - 2026-05-09
+
+"Dockd shipping integration" release. Sentry now serves a dedicated outbound shipping API for the in-warehouse dockd application: three endpoints under `/api/v1/dockd/orders/<so_number>` (GET, ship, void-ship) authenticated by per-station bearer tokens with `dockd.dispatch` scope, idempotent under retry via SHA-256 body-hash sentinel rows, and serialized against concurrent shipment via `SELECT ... FOR UPDATE` on the SO. Dockd ship and void-ship both write through the existing audit-log hash chain and the `integration_events` outbox so downstream ERPs see a fully-shipped or fully-reversed order.
+
+In parallel, the SO lifecycle gains `CANCELLED` status with end-to-end wiring (admin + inbound + dashboard counter), a new `sales_orders.memo` column inbound-mappable from connector and rendered through the picker / packer / shipper flows, several mobile and admin polish fixes, and a UI modernization of the Audit Log page.
+
+**Mobile.** v1.5.1 APK stays a working baseline for backend-only deployments. The v1.9 mobile build adds a memo block on Pack / Pack-Ship / Ship screens and fixes the pack-after-short-pick fallback bug (PackScreen and PackShipScreen used `||` against `quantity_picked`, falling back to `quantity_ordered` even on a fully-shorted line and blocking pack completion -- now uses `??` so a shorted pick of 0 stays 0). **Update to the v1.9 APK if you ship from the mobile flow.**
+
+### Added -- Dockd integration
+
+- **Migration 054** (#302): `item_fulfillments` gains 5 columns (`pre_ship_status VARCHAR(20)`, `voided_at TIMESTAMPTZ`, `voided_by VARCHAR(100)`, `void_reason VARCHAR(500)`, `shipping_cost NUMERIC(12,2)`) so a void can revert the SO to its pre-ship state and the audit row carries who voided and why. Adds `dockd_idempotency` (PK `(token_id, idempotency_key)`, FK CASCADE to `wms_tokens`, prune index on `created_at`) for sentinel-row idempotency. SET lock_timeout / statement_timeout per the v1.8 migration convention.
+- **`ship.voided/1` outbound event** (#303): JSON Schema (Draft 2020-12) at `api/schemas_v1/events/ship.voided/1.json` with required `sales_order_external_id`, `voided_at`, `voided_by_user_external_id`, `reason`, `reverted_to_status` (enum `PICKED` | `PACKED`). Registered in `V150_CATALOG`; emitted on the `integration_events` outbox at void time. New `ACTION_SHIP_VOID` audit-log action.
+- **`dockd.dispatch` token scope** (#304): a third `auth_middleware` dispatcher branch alongside `inbound` and `outbound`. Endpoint resolution gates the slug at the path layer (`_V190_DOCKD_FLASK_ENDPOINTS` frozenset); cross-direction tokens are rejected with 403 `wrong_token_direction`. Admin scope-catalog includes `dockd.dispatch`.
+- **`GET /api/v1/dockd/orders/<so_number>`** (#305): returns header + lines for an SO in PICKED / PACKED / SHIPPED state. Response carries the `X-Sentry-Canonical-Model: DRAFT-v1` header so dockd clients can detect a future schema bump.
+- **`POST /api/v1/dockd/orders/<so_number>/ship`** (#306): accepts `idempotency_key` (UUID4), `tracking_number`, `carrier`, optional `shipping_cost` (Decimal, decimal-bounded), and optional `dimensions`. Body validated through Pydantic with `extra="forbid"`. Idempotency uses sentinel-row INSERT ON CONFLICT against `dockd_idempotency` keyed on `(token_id, idempotency_key)` with SHA-256 body hash; replay with the same key + same body returns the original 200; same key + different body returns 409 `idempotency_body_mismatch`. Concurrent ship attempts on the same SO are serialized by `SELECT ... FOR UPDATE` on `sales_orders`. `SET LOCAL lock_timeout = '5s'` so a stuck FK share lock fails fast.
+- **`POST /api/v1/dockd/orders/<so_number>/void-ship`** (#307): reverses a SHIPPED SO back to its `pre_ship_status` (PICKED or PACKED), reverses the matching `item_fulfillments` row, rolls back `sales_order_lines.quantity_shipped`, writes `ACTION_SHIP_VOID` audit, emits `ship.voided/1`. Same idempotency + serialization as ship.
+- **OpenAPI 3.1 spec** (#308): generated at `docs/api/dockd-openapi.yaml` from the route-level Pydantic models + hand-rolled response schemas; CI runs `tools/scripts/regenerate-dockd-openapi.py --check` on every PR (drift -> red); local regen via `--stdout` or write mode.
+- **Integration test suite** (#309): coverage across migration / scope / GET / POST ship / POST void-ship / OpenAPI parity / e2e lifecycle / polling. Race + retry coverage: idempotency replay, body-hash mismatch, concurrent ship serialization, double-cancel, double-void.
+- **Polling-pipe coverage** (#310): `ship.voided/1` lands in `event_types` for the Fabric polling token at admin issue / rotate time. Fabric token rollout runbook published at `docs/runbooks/fabric-token-add-ship-voided.md`.
+- **Operator pre-provisioning runbook** (#312): `docs/runbooks/dockd-operator-provisioning.md` walks an operator through issuing per-station tokens, scope assignment, rotation cadence, and post-incident revoke.
+
+### Added -- Sales order lifecycle + memo
+
+- **`SO_CANCELLED` end-to-end** (#311): admin + inbound surfaces both delegate to `services/sales_order_service.cancel_sales_order(db, *, so_id, source, username)` with per-status unwind. OPEN / ALLOCATED release allocation; PICKED / PACKED revert allocated and packed counters and revert inventory back to the default receiving bin; all paths emit a single audit row. New `ACTION_CANCEL` audit constant. Inbound surface detects a cancel intent before `_upsert_canonical` so the cancel path is idempotent under re-POST. Dashboard counter shipped on the admin scope-catalog. **No outbound event** -- SO cancels travel ERP -> WMS, never WMS -> ERP.
+- **`sales_orders.memo` column** (#315 backend, #316 frontend): migration 055 + inbound mapping + admin / operator / dockd surfaces wire the new TEXT column (max 4096 chars) through every read path. Frontend renders memo block on Pack / Pack-Ship / Ship screens (warning-tinted callout) and the admin SO detail + edit modal (textarea). YAML template gains a `memo` example.
+
+### Added -- Audit log polish
+
+- **UI modernization** (#317): action types render as color-coded `tag-*` pills (lifecycle / security / config / warning / danger / success); entity column pairs the entity-type label with a mono entity name; details column shows chip-style key=value pairs capped at 3 with `+N more` overflow; user column appends `@warehouse` when present; filter bar moves to a labeled card with an Action select populated from the known constants and a Clear button; detail modal gains a header strip, structured KV grid, Copy JSON button, and Close footer button. Empty state distinguishes filtered vs. unfiltered.
+- **Expected vs. actual counts in details** (#318): PICK and TO_LINE_PICKED happy-path audit details gain `quantity_to_pick` alongside `quantity_picked` (matching the keys SHORT_PICK already writes). PACK details gain `total_expected` and `total_packed`. RECEIVE details gain `quantity_ordered` and `quantity_received_before` so cumulative PO state is reconstructable from one row. Hash chain unaffected; only the JSONB payload shape changes.
+
+### Fixed
+
+- **Mobile pack-after-short-pick** (#313): `PackScreen.js` and `PackShipScreen.js` used `quantity_picked || quantity_ordered` for short-pick fallback. JS `||` falls back on 0 (falsy), so a fully-shorted line (picked = 0) silently fell back to ordered and required N scans against an empty pick, blocking pack completion. Fixed to `??` (nullish coalescing) at three sites in each screen.
+- **SHIPPED status badge color** (#314): the SHIPPED tag-gray pill in the admin SO list now renders in the success-green palette so it visually matches its terminal-state semantics.
+- **Stray version strings** (#319): admin Settings about-card and mobile login / home footers updated from `1.5.0` to `1.9.0`.
+
+### Refactored
+
+- **`services/shipping_service.record_ship`** (#301): extracted from `api/routes/shipping.py` so the dockd POST /ship and the existing operator-flow shipping endpoint share one transactional implementation. `record_ship` accepts optional `pre_ship_status`, `shipping_cost`, and `audit_details_extra` to cover both surfaces.
+
+### Migrations
+
+- **054** (#302) -- `item_fulfillments` void columns + `dockd_idempotency` table.
+- **055** (#315) -- `sales_orders.memo TEXT`.
+
+Both migrations declare `SET lock_timeout = '5s'` + `SET statement_timeout = '60s'` and use `IF NOT EXISTS` guards per the v1.8 convention. Forward-only; existing rows have NULL for the new columns.
+
 ## [v1.8.0] - 2026-05-07
 
 "Transfer Orders + Productivity Dashboard" release. Sentry now ships its first internal warehouse-to-warehouse workflow end-to-end: import a TO via CSV (with shortage detection + per-line commit), pick through the existing mobile flow via a new `pick_tasks.to_id` discriminator, batch picks into an admin-approval row, approve to move inventory source -> destination + emit `transfer.completed/1` to the outbox, or reject for re-pick. The operations-overview Dashboard is replaced with a per-user productivity grid (Picking units / Packing units / Shipped orders / Received unique SKUs / Put Away unique SKUs) backed by `audit_log` aggregation through a new compound covering index.
