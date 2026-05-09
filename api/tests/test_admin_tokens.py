@@ -440,13 +440,18 @@ class TestScopeCatalog:
         # mismatched and token scope would break silently.
         assert "events.poll" in endpoints
         assert "snapshot.inventory" in endpoints
-        # Full expected set is the V150 slugs plus dockd.dispatch when
-        # the dockd surface is registered (v1.9.0).
+        # Full expected set is the V150 slugs plus dockd.dispatch (v1.9.0)
+        # plus pos.dispatch (v1.10.0) when each surface is registered.
         from middleware.auth_middleware import (
             V150_ENDPOINT_SLUGS,
             V190_DOCKD_SLUG,
+            V1100_POS_SLUG,
         )
-        expected = set(V150_ENDPOINT_SLUGS.keys()) | {V190_DOCKD_SLUG}
+        expected = (
+            set(V150_ENDPOINT_SLUGS.keys())
+            | {V190_DOCKD_SLUG}
+            | {V1100_POS_SLUG}
+        )
         assert endpoints == expected
 
     def test_event_types_are_sorted(self, client, auth_headers):

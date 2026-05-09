@@ -410,6 +410,7 @@ def create_app():
     from routes.inbound import inbound_bp
     from routes.dashboard import dashboard_bp
     from routes.dockd import dockd_bp
+    from routes.pos import pos_bp
 
     app.register_blueprint(auth_bp, url_prefix="/api/auth")
     app.register_blueprint(lookup_bp, url_prefix="/api/lookup")
@@ -439,6 +440,12 @@ def create_app():
     # and reuse this blueprint. Gated by @require_wms_token's V190
     # dispatcher branch (dockd.dispatch slug, exclusive direction).
     app.register_blueprint(dockd_bp, url_prefix="/api/v1/dockd")
+    # v1.10.0 POS endpoint surface. GET /availability lands in this
+    # commit; POST /validate-cart, /checkout, /refund arrive in
+    # subsequent ones and reuse this blueprint. Gated by
+    # @require_wms_token's V1100 dispatcher branch (pos.dispatch slug,
+    # exclusive direction).
+    app.register_blueprint(pos_bp, url_prefix="/api/v1/pos")
 
     # Import connector modules so they auto-register with the registry
     import connectors.example  # noqa: F401
