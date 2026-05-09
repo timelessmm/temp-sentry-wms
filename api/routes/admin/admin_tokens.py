@@ -204,6 +204,8 @@ def scope_catalog():
         V170_INBOUND_RESOURCE_BY_ENDPOINT,
         V190_DOCKD_SLUG,
         _V190_DOCKD_FLASK_ENDPOINTS,
+        V1100_POS_SLUG,
+        _V1100_POS_FLASK_ENDPOINTS,
     )
 
     event_types = sorted({entry[0] for entry in V150_CATALOG})
@@ -220,6 +222,12 @@ def scope_catalog():
     # during a rename.
     if registered & _V190_DOCKD_FLASK_ENDPOINTS:
         endpoints = sorted(set(endpoints) | {V190_DOCKD_SLUG})
+    # v1.10.0 POS: same shape as the dockd block. The slug appears in
+    # the catalog only after at least one /api/v1/pos/ route registers,
+    # so admins cannot issue a pos.dispatch token before the surface
+    # exists.
+    if registered & _V1100_POS_FLASK_ENDPOINTS:
+        endpoints = sorted(set(endpoints) | {V1100_POS_SLUG})
     inbound_resources = sorted(set(V170_INBOUND_RESOURCE_BY_ENDPOINT.values()))
     source_rows = g.db.execute(
         text(
