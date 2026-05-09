@@ -109,7 +109,7 @@ _GET_ORDER_RESPONSE_SCHEMA: Dict[str, Any] = {
     "additionalProperties": False,
     "required": [
         "so_number", "external_id", "status", "warehouse_id",
-        "customer_name", "customer_phone", "shipping_address",
+        "customer_name", "customer_phone", "memo", "shipping_address",
         "ship_method", "items", "order_total", "customer_shipping_paid",
         "marketplace", "order_date", "ff_created_at", "shippable",
         "shippable_from_statuses", "shipped_by", "tracking_number",
@@ -122,6 +122,7 @@ _GET_ORDER_RESPONSE_SCHEMA: Dict[str, Any] = {
         "warehouse_id":            {"type": "integer"},
         "customer_name":           {"type": ["string", "null"]},
         "customer_phone":          {"type": ["string", "null"]},
+        "memo":                    {"type": ["string", "null"]},
         "shipping_address":        _ADDRESS_SCHEMA,
         "ship_method":             {"type": ["string", "null"]},
         "items": {

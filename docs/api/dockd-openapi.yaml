@@ -220,6 +220,10 @@ paths:
                     type:
                     - string
                     - 'null'
+                  memo:
+                    type:
+                    - string
+                    - 'null'
                   order_date:
                     format: date-time
                     type:
@@ -314,6 +318,7 @@ paths:
                 - warehouse_id
                 - customer_name
                 - customer_phone
+                - memo
                 - shipping_address
                 - ship_method
                 - items

@@ -218,6 +218,11 @@ CREATE TABLE sales_orders (
     -- schema; the column itself is permissive.
     order_total            NUMERIC(12,2),
     customer_shipping_paid NUMERIC(12,2),
+    -- v1.9.0: free-text operator-facing note from the source ERP.
+    -- Surfaced on picker / packer / shipper screens and the dockd
+    -- load-on-scan endpoint so warehouse staff see customer notes
+    -- ("leave at back door", "fragile, double-box", etc.).
+    memo TEXT,
     order_date TIMESTAMPTZ,
     ship_by_date DATE,
     created_at TIMESTAMPTZ DEFAULT NOW(),

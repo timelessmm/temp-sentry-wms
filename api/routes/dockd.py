@@ -119,7 +119,7 @@ def get_order(so_number):
         text(
             """
             SELECT so_id, so_number, external_id, status, warehouse_id,
-                   customer_name, customer_phone, ship_method,
+                   customer_name, customer_phone, ship_method, memo,
                    shipping_address_name, shipping_address_line1,
                    shipping_address_line2, shipping_address_city,
                    shipping_address_state, shipping_address_postal_code,
@@ -183,6 +183,7 @@ def get_order(so_number):
         "warehouse_id": so.warehouse_id,
         "customer_name": so.customer_name,
         "customer_phone": so.customer_phone,
+        "memo": so.memo,
         "shipping_address": {
             "name": so.shipping_address_name,
             "line1": so.shipping_address_line1,

@@ -92,6 +92,7 @@ def _insert_so(
     carrier=None,
     tracking_number=None,
     shipped_at=None,
+    memo=None,
 ):
     """Insert a sales_orders row via the test transactional connection.
     Returns the so_id and the assigned so_number.
@@ -107,13 +108,13 @@ def _insert_so(
         " shipping_address_name, shipping_address_line1, shipping_address_line2,"
         " shipping_address_city, shipping_address_state, shipping_address_postal_code,"
         " shipping_address_country, shipping_address_phone,"
-        " order_total, customer_shipping_paid,"
+        " order_total, customer_shipping_paid, memo,"
         " carrier, tracking_number, shipped_at"
         ") VALUES ("
         " %s,%s,%s,%s,%s,"
         " %s,%s,%s,"
         " %s,%s,%s,%s,%s,%s,%s,%s,"
-        " %s,%s,%s,%s,%s"
+        " %s,%s,%s,%s,%s,%s"
         ") RETURNING so_id",
         (
             so_number, customer_name, customer_phone, status, warehouse_id,
@@ -121,7 +122,7 @@ def _insert_so(
             addr.get("name"), addr.get("line1"), addr.get("line2"),
             addr.get("city"), addr.get("state"), addr.get("postal_code"),
             addr.get("country"), addr.get("phone"),
-            order_total, customer_shipping_paid,
+            order_total, customer_shipping_paid, memo,
             carrier, tracking_number, shipped_at,
         ),
     )
@@ -416,6 +417,31 @@ class TestShippedSo:
 # ----------------------------------------------------------------------
 # NULL preservation
 # ----------------------------------------------------------------------
+
+
+class TestMemoField:
+    def test_memo_surfaces_in_get_response(self, client, dockd_token):
+        item_id = _insert_item()
+        so_id, so_number = _insert_so(memo="leave at back door")
+        _insert_so_line(so_id, item_id)
+        resp = client.get(
+            f"/api/v1/dockd/orders/{so_number}",
+            headers={"X-WMS-Token": dockd_token["plaintext"]},
+        )
+        assert resp.status_code == 200
+        body = resp.get_json()
+        assert body["memo"] == "leave at back door"
+
+    def test_memo_null_when_unset(self, client, dockd_token):
+        item_id = _insert_item()
+        so_id, so_number = _insert_so()
+        _insert_so_line(so_id, item_id)
+        resp = client.get(
+            f"/api/v1/dockd/orders/{so_number}",
+            headers={"X-WMS-Token": dockd_token["plaintext"]},
+        )
+        body = resp.get_json()
+        assert body["memo"] is None
 
 
 class TestNullPreservation:

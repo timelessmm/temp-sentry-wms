@@ -29,7 +29,7 @@ def get_order(barcode):
         text(
             f"""
             SELECT so_id, so_number, so_barcode, customer_name, status,
-                   ship_method, ship_address, warehouse_id
+                   ship_method, ship_address, warehouse_id, memo
             FROM sales_orders
             WHERE (so_barcode = :barcode OR so_number = :barcode)
               {scope_clause}
@@ -97,6 +97,7 @@ def get_order(barcode):
             "ship_method": so.ship_method,
             "ship_address": so.ship_address,
             "warehouse_id": so.warehouse_id,
+            "memo": so.memo,
         },
         "lines": line_list,
         "calculated_weight_lbs": round(calculated_weight, 2),

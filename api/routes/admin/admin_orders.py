@@ -297,7 +297,7 @@ def list_sales_orders():
             SELECT so_id, so_number, so_barcode, customer_name, customer_phone, customer_address,
                    status, priority, warehouse_id,
                    ship_method, ship_address, order_date, ship_by_date, created_at, created_by,
-                   carrier, tracking_number, shipped_at
+                   carrier, tracking_number, shipped_at, memo
             FROM sales_orders {where_sql} ORDER BY so_id DESC LIMIT :limit OFFSET :offset
         """),
         params,
@@ -313,7 +313,8 @@ def list_sales_orders():
              "ship_by_date": r.ship_by_date.isoformat() if r.ship_by_date else None,
              "created_at": r.created_at.isoformat() if r.created_at else None, "created_by": r.created_by,
              "carrier": r.carrier, "tracking_number": r.tracking_number,
-             "shipped_at": r.shipped_at.isoformat() if r.shipped_at else None}
+             "shipped_at": r.shipped_at.isoformat() if r.shipped_at else None,
+             "memo": r.memo}
             for r in rows
         ],
         "total": total, "page": page, "per_page": per_page, "pages": pages,
@@ -331,7 +332,7 @@ def get_sales_order(so_id):
                    warehouse_id, ship_method, ship_address,
                    order_date, ship_by_date, created_at, picked_at, packed_at,
                    shipped_at, created_by,
-                   order_total, customer_shipping_paid,
+                   order_total, customer_shipping_paid, memo,
                    billing_address_name, billing_address_line1, billing_address_line2,
                    billing_address_city, billing_address_state,
                    billing_address_postal_code, billing_address_country,
@@ -374,6 +375,8 @@ def get_sales_order(so_id):
                 str(so.customer_shipping_paid)
                 if so.customer_shipping_paid is not None else None
             ),
+            # v1.9.0: free-text operator-facing note (mig 055).
+            "memo": so.memo,
             # v1.8.0 (#288): structured billing/shipping address fields.
             **{name: getattr(so, name) for name in ADDRESS_FIELD_NAMES},
         },
@@ -408,8 +411,8 @@ def create_sales_order(validated):
 
     result = g.db.execute(
         text("""
-            INSERT INTO sales_orders (so_number, so_barcode, customer_name, customer_phone, customer_address, warehouse_id, ship_method, ship_address, ship_by_date, order_date, created_by, status, external_id)
-            VALUES (:sn, :sb, :cust, :phone, :caddr, :wid, :ship, :addr, :ship_by, NOW(), :created_by, :status, :ext_id)
+            INSERT INTO sales_orders (so_number, so_barcode, customer_name, customer_phone, customer_address, warehouse_id, ship_method, ship_address, ship_by_date, memo, order_date, created_by, status, external_id)
+            VALUES (:sn, :sb, :cust, :phone, :caddr, :wid, :ship, :addr, :ship_by, :memo, NOW(), :created_by, :status, :ext_id)
             RETURNING so_id
         """),
         {
@@ -418,7 +421,8 @@ def create_sales_order(validated):
             "caddr": data.get("customer_address"),
             "wid": data["warehouse_id"],
             "ship": data.get("ship_method"), "addr": data.get("ship_address"),
-            "ship_by": data.get("ship_by_date"), "created_by": g.current_user["username"],
+            "ship_by": data.get("ship_by_date"), "memo": data.get("memo"),
+            "created_by": g.current_user["username"],
             "status": SO_OPEN,
             "ext_id": str(uuid.uuid4()),
         },
@@ -454,7 +458,7 @@ def update_sales_order(so_id, validated):
     if so.status != SO_OPEN:
         return jsonify({"error": f"Can only update SOs with OPEN status. Current: {so.status}"}), 400
 
-    ALLOWED_FIELDS = {"so_number", "so_barcode", "customer_name", "customer_phone", "customer_address", "ship_method", "ship_address", "ship_by_date", "priority"}
+    ALLOWED_FIELDS = {"so_number", "so_barcode", "customer_name", "customer_phone", "customer_address", "ship_method", "ship_address", "ship_by_date", "priority", "memo"}
     fields, params = [], {"sid": so_id}
     for col in ALLOWED_FIELDS:
         if col in data:
