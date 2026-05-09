@@ -254,6 +254,29 @@ def create_app():
                 f"value in [16, 1024] or unset for the 64 KB default."
             )
 
+    # v1.10.0 POS: third body-size cap. POS POST bodies (checkout +
+    # refund + validate-cart) carry many cart lines and tender details,
+    # bigger than a dockd ship but smaller than an inbound canonical
+    # upsert. Default 256 KB clamped to [16, 4096]. Same fail-loud-on-
+    # typo posture as inbound and dockd.
+    _pos_max_body_raw = os.getenv("SENTRY_POS_MAX_BODY_KB")
+    if _pos_max_body_raw is not None and _pos_max_body_raw.strip() != "":
+        try:
+            _pos_max_body_kb = int(_pos_max_body_raw)
+        except ValueError:
+            raise RuntimeError(
+                f"SENTRY_POS_MAX_BODY_KB={_pos_max_body_raw!r} is not "
+                f"an integer. Unset for the default (256), or set to a "
+                f"value in [16, 4096]."
+            )
+        if _pos_max_body_kb < 16 or _pos_max_body_kb > 4096:
+            raise RuntimeError(
+                f"SENTRY_POS_MAX_BODY_KB={_pos_max_body_kb} is outside "
+                f"the [16, 4096] range. A typo'd value would silently "
+                f"degrade the body-size cap; refusing to boot. Set to a "
+                f"value in [16, 4096] or unset for the 256 KB default."
+            )
+
     # v1.7.0 Pipe B: load every mapping document under
     # SENTRY_INBOUND_MAPPINGS_DIR (default /db/mappings) at boot. Cross-checks
     # against inbound_source_systems_allowlist; an allowlisted source_system

@@ -32,10 +32,13 @@ Path / query parameter validation:
 import re
 
 from flask import Blueprint, g, jsonify, make_response, request
+from pydantic import ValidationError
 from sqlalchemy import text
 
 from middleware.auth_middleware import require_wms_token
 from middleware.db import with_db
+from schemas.pos import ValidateCartBody
+from services.pos_service import get_max_body_kb
 from services.rate_limit import limiter
 
 
@@ -249,3 +252,140 @@ def availability():
         "availability": availability_by_warehouse,
     }
     return _draft_response(body, 200)
+
+
+# ----------------------------------------------------------------------
+# POST /api/v1/pos/validate-cart
+# ----------------------------------------------------------------------
+
+
+def _classify_line(row, token_warehouse_ids):
+    """Map one bulk-query row to a conflict reason or None.
+
+    Reason precedence (most informative first):
+      sku_not_found ->
+      item_inactive ->
+      warehouse_not_found ->
+      warehouse_not_in_scope ->
+      bin_not_found ->
+      insufficient_stock
+
+    A line that has multiple problems surfaces under the first
+    precedence-order reason that applies; the cashier sees the most
+    actionable cause without enumerating sister failures.
+    """
+    if row.item_id is None:
+        return "sku_not_found", None
+    if not row.is_active:
+        return "item_inactive", None
+    if row.warehouse_id is None:
+        return "warehouse_not_found", None
+    if row.warehouse_id not in token_warehouse_ids:
+        return "warehouse_not_in_scope", None
+    if row.bin_id is None:
+        return "bin_not_found", None
+    available = int(row.available)
+    if available < int(row.requested_qty):
+        return "insufficient_stock", available
+    return None, None
+
+
+@pos_bp.route("/validate-cart", methods=["POST"])
+@require_wms_token
+@limiter.limit("60 per minute")
+@with_db
+def validate_cart():
+    """Pre-flight cart validation called by the POS Service just before
+    initiating a Windcave charge. Read-only. Returns 200 valid:true
+    when every line passes; 409 valid:false with all conflicts in one
+    response when any line fails.
+    """
+    cap_bytes = get_max_body_kb() * 1024
+    if request.content_length is not None and request.content_length > cap_bytes:
+        return _err(
+            "body_too_large",
+            "request body exceeds SENTRY_POS_MAX_BODY_KB",
+            413,
+            {"max_body_kb": get_max_body_kb()},
+        )
+
+    try:
+        body = ValidateCartBody.model_validate(request.get_json(silent=False))
+    except ValidationError as exc:
+        first = exc.errors()[0]
+        field = ".".join(str(p) for p in first.get("loc", ()))
+        return _err(
+            "invalid_body",
+            "body failed schema validation",
+            422,
+            {"field": field, "reason": first.get("type", "value_error")},
+        )
+    except Exception:
+        return _err("invalid_body", "body is not valid JSON", 422)
+
+    token_warehouse_ids = list(g.current_token.get("warehouse_ids") or [])
+
+    # Bulk classification query. unnest() turns the five parallel arrays
+    # into one row per line, then LEFT JOINs resolve each lookup
+    # independently so a missing item / warehouse / bin produces a NULL
+    # column instead of dropping the row. The aggregate keeps only
+    # in-scope inventory contributing to available qty (the warehouse-
+    # scope conflation lives in the Python classifier, not the SQL).
+    rows = g.db.execute(
+        text(
+            """
+            SELECT i.idx,
+                   i.sku, i.warehouse_code, i.bin_code, i.requested_qty,
+                   itm.item_id, itm.is_active,
+                   w.warehouse_id,
+                   b.bin_id,
+                   COALESCE(SUM(inv.quantity_on_hand - inv.quantity_allocated), 0) AS available
+              FROM unnest(
+                       CAST(:idxs       AS int[]),
+                       CAST(:skus       AS text[]),
+                       CAST(:wh_codes   AS text[]),
+                       CAST(:bin_codes  AS text[]),
+                       CAST(:qtys       AS int[])
+                   ) AS i(idx, sku, warehouse_code, bin_code, requested_qty)
+              LEFT JOIN items      itm ON itm.sku            = i.sku
+              LEFT JOIN warehouses w   ON w.warehouse_code   = i.warehouse_code
+              LEFT JOIN bins       b   ON b.bin_code         = i.bin_code
+                                       AND b.warehouse_id    = w.warehouse_id
+              LEFT JOIN inventory  inv ON inv.item_id        = itm.item_id
+                                       AND inv.bin_id        = b.bin_id
+                                       AND inv.warehouse_id  = w.warehouse_id
+             GROUP BY i.idx, i.sku, i.warehouse_code, i.bin_code, i.requested_qty,
+                      itm.item_id, itm.is_active, w.warehouse_id, b.bin_id
+             ORDER BY i.idx
+            """
+        ),
+        {
+            "idxs":      list(range(len(body.lines))),
+            "skus":      [ln.sku for ln in body.lines],
+            "wh_codes":  [ln.warehouse_id for ln in body.lines],
+            "bin_codes": [ln.bin_id for ln in body.lines],
+            "qtys":      [ln.quantity for ln in body.lines],
+        },
+    ).fetchall()
+
+    conflicts = []
+    for row in rows:
+        reason, available_qty = _classify_line(row, token_warehouse_ids)
+        if reason is None:
+            continue
+        entry = {
+            "line_index":    row.idx,
+            "sku":           row.sku,
+            "warehouse_id":  row.warehouse_code,
+            "bin_id":        row.bin_code,
+            "requested_qty": int(row.requested_qty),
+            "reason":        reason,
+        }
+        if available_qty is not None:
+            entry["available_qty"] = available_qty
+        conflicts.append(entry)
+
+    if not conflicts:
+        return _draft_response({"valid": True}, 200)
+
+    return _draft_response({"valid": False, "conflicts": conflicts}, 409)
