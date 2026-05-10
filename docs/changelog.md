@@ -6,6 +6,50 @@ is a shorter, docs-site-friendly summary.
 
 ---
 
+## v1.10.0 -- POS endpoint surface
+
+*2026-05-09.* [Full notes](https://github.com/hightower-systems/sentry-wms/releases/tag/v1.10.0).
+
+Sentry now serves a dedicated counter-sale API for an external POS
+Service. Four endpoints under `/api/v1/pos/` (`GET /availability`,
+`POST /validate-cart`, `POST /checkout`, `POST /refund`) authenticate
+via a new fourth direction `pos.dispatch` alongside outbound polling,
+inbound POST, and dockd. Checkout and refund are atomic single-
+transaction routes with `SELECT ... FOR UPDATE` on the inventory rows
+being decremented or re-incremented, idempotent on a per-route
+`idempotency_key` (UUID4) with a SHA-256 body hash so a retry with the
+same key + same body replays the cached response and a retry with the
+same key + different body returns 409.
+
+Refund enforces a 90-day window from the original sale's `created_at`,
+a card-vs-cash tender lock comparing the original `POS_CHECKOUT` audit
+row's `payment_method` against `body.refund_summary.method`, and a
+once-per-original-SO guard via `refunded_at` / `refund_so_id` on the
+original `sales_orders` row. Missing / out-of-scope / wrong-source /
+wrong-state original SOs conflate to 404 `original_so_not_found` to
+prevent enumeration; the 422 informational rules only fire after the
+token has proven it can see the SO.
+
+PCI-scope guard at the Pydantic boundary: `CardTender` is a strict-
+typed model with `extra='forbid'` accepting exactly `{type, amount_cents,
+card_brand, card_last4, auth_code, external_ref}`. Any other field
+(`card_pan`, `full_track`, expiry, cvv, etc.) fails 422 at the schema
+layer so Sentry never accepts PAN-shaped data on the wire.
+
+Pricing stays out of Sentry's columns: per-line `unit_price_cents` /
+`tax_cents` / `line_total_cents` ride on the wire and live exclusively
+in `audit_log.details` for archival; mig 056 added no per-line price
+columns. The POS Service owns its own pricing source. New
+`ACTION_POS_CHECKOUT` and `ACTION_POS_REFUND` audit constants extend
+the v1.4 hash chain.
+
+One migration (056). No new APK published; v1.9.0 APK
+(`sentry-wms-v1.9.0.apk`, versionCode 6) remains the working baseline
+since v1.10.0 has no mobile changes. Operators running the v1.9.0
+mobile app continue to work against a v1.10.0 backend with no upgrade.
+
+---
+
 ## v1.9.0 -- Dockd shipping integration
 
 *2026-05-09.* [Full notes](https://github.com/hightower-systems/sentry-wms/releases/tag/v1.9.0).
