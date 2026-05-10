@@ -277,6 +277,34 @@ def create_app():
                 f"value in [16, 4096] or unset for the 256 KB default."
             )
 
+    # v1.10.0 POS: lock_timeout / statement_timeout for the atomic
+    # checkout + refund routes. SET LOCAL inside the request transaction
+    # so a deadlock or runaway surfaces as a caught LockNotAvailable /
+    # QueryCanceled (-> 503 lock_contention) rather than blocking the
+    # handler. Both in milliseconds, bounded [100, 30000].
+    for _name, _default in (
+        ("SENTRY_POS_LOCK_TIMEOUT_MS", 2000),
+        ("SENTRY_POS_STATEMENT_TIMEOUT_MS", 4000),
+    ):
+        _raw = os.getenv(_name)
+        if _raw is None or _raw.strip() == "":
+            continue
+        try:
+            _val = int(_raw)
+        except ValueError:
+            raise RuntimeError(
+                f"{_name}={_raw!r} is not an integer. Unset for the "
+                f"default ({_default}), or set to a value in [100, 30000]."
+            )
+        if _val < 100 or _val > 30000:
+            raise RuntimeError(
+                f"{_name}={_val} is outside the [100, 30000] range. A "
+                f"typo'd value would either deadlock the handler or "
+                f"silently wait forever; refusing to boot. Set to a "
+                f"value in [100, 30000] or unset for the {_default} ms "
+                f"default."
+            )
+
     # v1.7.0 Pipe B: load every mapping document under
     # SENTRY_INBOUND_MAPPINGS_DIR (default /db/mappings) at boot. Cross-checks
     # against inbound_source_systems_allowlist; an allowlisted source_system

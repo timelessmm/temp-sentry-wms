@@ -15,9 +15,11 @@ respectively (string), not the integer surrogate keys; the conversion
 to integer IDs happens inside the route's bulk classification query.
 """
 
-from typing import List
+from datetime import datetime
+from typing import List, Literal, Optional, Union
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, UUID4
+from typing_extensions import Annotated
 
 
 # Column-width caps. Matching the DB columns means a Pydantic-validated
@@ -68,3 +70,120 @@ class ValidateCartBody(BaseModel):
         min_length=_LINES_MIN,
         max_length=_LINES_MAX,
     )
+
+
+# ----------------------------------------------------------------------
+# Checkout body
+# ----------------------------------------------------------------------
+
+# Width caps for the checkout-specific fields. Each matches the DB
+# column or the upstream wire shape it is captured against.
+_EXTERNAL_TXN_REF_MAX = 128       # matches sales_orders.external_txn_ref VARCHAR(128)
+_CASHIER_ID_MAX       = 100       # matches audit_log.user_id VARCHAR(100)
+_TERMINAL_ID_MAX      = 100
+_FULFILLMENT_NOTE_MAX = 500       # operator-facing note; 500 matches the v1.9 void-reason cap
+_CARD_BRAND_MAX       = 50        # 'Visa', 'Mastercard', etc.
+_CARD_LAST4_LEN       = 4
+_AUTH_CODE_MAX        = 50
+
+# Per-cart cents bounds. ge=0 because zero-cents is meaningful for a
+# fully-discounted line; the upper bound matches NUMERIC(12,2) cents
+# (10**12 - 1) so an integer overflow in the POS Service cannot produce
+# a value Sentry silently truncates.
+_CENTS_MIN = 0
+_CENTS_MAX = 10**12 - 1
+
+
+class CheckoutLine(BaseModel):
+    """One line in a counter sale.
+
+    unit_price_cents / tax_cents / line_total_cents are trust-the-caller
+    archival fields. Sentry stores them in audit_log.details (no per-
+    line price columns; mig 056 did not add them) and never recomputes
+    or validates the total. Pricing is the POS Service's domain.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    sku:               str           = Field(..., min_length=1, max_length=_SKU_MAX)
+    warehouse_id:      str           = Field(..., min_length=1, max_length=_WAREHOUSE_CODE_MAX)
+    bin_id:            str           = Field(..., min_length=1, max_length=_BIN_CODE_MAX)
+    quantity:          int           = Field(..., ge=_QTY_MIN, le=_QTY_MAX)
+    unit_price_cents:  int           = Field(..., ge=_CENTS_MIN, le=_CENTS_MAX)
+    tax_cents:         int           = Field(..., ge=_CENTS_MIN, le=_CENTS_MAX)
+    line_total_cents:  int           = Field(..., ge=_CENTS_MIN, le=_CENTS_MAX)
+    fulfillment_note:  Optional[str] = Field(None, max_length=_FULFILLMENT_NOTE_MAX)
+
+
+class CardTender(BaseModel):
+    """Card payment tender. The accepted card-side fields are an
+    explicit allowlist: brand, last4, auth_code, external_ref. Any
+    other field (card_pan, full_track, expiry, cvv) fails the
+    extra='forbid' gate at the Pydantic boundary so Sentry never
+    accepts PAN-shaped data on the wire (PCI scope guard).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    type:         Literal["card"] = "card"
+    amount_cents: int             = Field(..., ge=_CENTS_MIN, le=_CENTS_MAX)
+    card_brand:   str             = Field(..., min_length=1, max_length=_CARD_BRAND_MAX)
+    card_last4:   str             = Field(..., min_length=_CARD_LAST4_LEN, max_length=_CARD_LAST4_LEN)
+    auth_code:    str             = Field(..., min_length=1, max_length=_AUTH_CODE_MAX)
+    external_ref: str             = Field(..., min_length=1, max_length=_EXTERNAL_TXN_REF_MAX)
+
+
+class CashTender(BaseModel):
+    """Cash payment tender. amount_tendered_cents and change_cents are
+    the cashier-facing breakdown: tendered = amount + change."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    type:                  Literal["cash"] = "cash"
+    amount_cents:          int             = Field(..., ge=_CENTS_MIN, le=_CENTS_MAX)
+    amount_tendered_cents: int             = Field(..., ge=_CENTS_MIN, le=_CENTS_MAX)
+    change_cents:          int             = Field(..., ge=_CENTS_MIN, le=_CENTS_MAX)
+
+
+# Pydantic 2 discriminated union: the `type` field selects the model.
+# A tender carrying `type: "card"` parses against CardTender (PAN
+# rejected by extra='forbid'); `type: "cash"` parses against
+# CashTender. An unknown `type` fails 422 invalid_body.
+Tender = Annotated[
+    Union[CardTender, CashTender],
+    Field(discriminator="type"),
+]
+
+
+class PaymentSummary(BaseModel):
+    """Header-level totals + tender breakdown. Trust-the-caller; Sentry
+    archives the structure in audit_log.details and never recomputes."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    method:         Literal["card", "cash"]
+    subtotal_cents: int          = Field(..., ge=_CENTS_MIN, le=_CENTS_MAX)
+    tax_cents:      int          = Field(..., ge=_CENTS_MIN, le=_CENTS_MAX)
+    total_cents:    int          = Field(..., ge=_CENTS_MIN, le=_CENTS_MAX)
+    tenders:        List[Tender] = Field(..., min_length=1, max_length=8)
+
+
+class CheckoutBody(BaseModel):
+    """POST /api/v1/pos/checkout body.
+
+    idempotency_key is validated as UUID4 (not raw str) so a non-UUID
+    value surfaces as 422 invalid_body instead of slipping into the
+    cache as opaque bytes. completed_at is a wire timestamp (the
+    cashier's stated completion time); Sentry uses it as
+    sales_orders.shipped_at. created_at on the row is NOW().
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    idempotency_key:   UUID4
+    external_txn_ref:  str             = Field(..., min_length=1, max_length=_EXTERNAL_TXN_REF_MAX)
+    cashier_id:        str             = Field(..., min_length=1, max_length=_CASHIER_ID_MAX)
+    terminal_id:       str             = Field(..., min_length=1, max_length=_TERMINAL_ID_MAX)
+    completed_at:      datetime
+    payment_summary:   PaymentSummary
+    lines:             List[CheckoutLine] = Field(..., min_length=_LINES_MIN, max_length=_LINES_MAX)
