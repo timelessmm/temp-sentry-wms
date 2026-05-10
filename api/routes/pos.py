@@ -39,10 +39,10 @@ from pydantic import ValidationError
 from sqlalchemy import text
 from sqlalchemy.exc import OperationalError
 
-from constants import ACTION_POS_CHECKOUT
+from constants import ACTION_POS_CHECKOUT, ACTION_POS_REFUND
 from middleware.auth_middleware import require_wms_token
 from middleware.db import with_db
-from schemas.pos import CheckoutBody, ValidateCartBody
+from schemas.pos import CheckoutBody, RefundBody, ValidateCartBody
 from services.audit_service import write_audit_log
 from services.pos_service import get_max_body_kb, lock_timeouts_ms
 from services.rate_limit import limiter
@@ -834,6 +834,500 @@ def checkout():
         ),
         {
             "so_id": so_id,
+            "body":  json.dumps(response_body_dict),
+        },
+    )
+
+    g.db.commit()
+
+    return _draft_response(response_body_dict, 200)
+
+
+# ----------------------------------------------------------------------
+# POST /api/v1/pos/refund
+# ----------------------------------------------------------------------
+
+
+# 90-day refund window from the doc. The original SO must have been
+# created within this window for a refund to be accepted.
+_REFUND_WINDOW_DAYS = 90
+
+
+def _bulk_resolve_locations(db, lines_locations):
+    """Resolve a list of (sku, warehouse_code, bin_code) tuples to the
+    matching (item_id, warehouse_id, bin_id) integer triples via a
+    single unnest()-LEFT JOIN query.
+
+    Used by the refund route to translate the audit_log-captured
+    line locations of the original sale into internal IDs for the
+    SELECT FOR UPDATE + re-increment step. Returns one result row
+    per input tuple, in input order; any unresolved row carries
+    NULL columns and the caller treats that as a data-integrity
+    surprise (the original sale created these inventory rows; they
+    should not have been deleted between sale and refund).
+    """
+    return db.execute(
+        text(
+            """
+            SELECT i.idx, i.sku, i.warehouse_code, i.bin_code, i.qty,
+                   itm.item_id,
+                   w.warehouse_id,
+                   b.bin_id
+              FROM unnest(
+                       CAST(:idxs       AS int[]),
+                       CAST(:skus       AS text[]),
+                       CAST(:wh_codes   AS text[]),
+                       CAST(:bin_codes  AS text[]),
+                       CAST(:qtys       AS int[])
+                   ) AS i(idx, sku, warehouse_code, bin_code, qty)
+              LEFT JOIN items      itm ON itm.sku           = i.sku
+              LEFT JOIN warehouses w   ON w.warehouse_code  = i.warehouse_code
+              LEFT JOIN bins       b   ON b.bin_code        = i.bin_code
+                                       AND b.warehouse_id   = w.warehouse_id
+             ORDER BY i.idx
+            """
+        ),
+        {
+            "idxs":      list(range(len(lines_locations))),
+            "skus":      [ln["sku"] for ln in lines_locations],
+            "wh_codes":  [ln["warehouse_id"] for ln in lines_locations],
+            "bin_codes": [ln["bin_id"] for ln in lines_locations],
+            "qtys":      [ln["quantity"] for ln in lines_locations],
+        },
+    ).fetchall()
+
+
+@pos_bp.route("/refund", methods=["POST"])
+@require_wms_token
+@limiter.limit(
+    "10 per minute",
+    exempt_when=lambda: getattr(g, "_pos_replay_hit", False),
+)
+@with_db
+def refund():
+    """Atomically reverse a previously-completed POS sale.
+
+    Creates a credit-memo SO (negative-quantity sibling of the
+    original) and re-increments inventory back to the original
+    warehouse + bin. Idempotent on the refund's idempotency_key
+    (separate from the original sale's key). Marks the original SO
+    with refunded_at + refund_so_id so a second refund attempt
+    surfaces as 422 already_refunded.
+
+    Server-side rules:
+    - 90-day window from the original sale's created_at.
+    - Tender lock: card sales refund to card, cash sales refund to
+      cash. Comparison reads the original payment_method from the
+      POS_CHECKOUT audit_log row.
+    - Once refunded, never again.
+    - Original SO must be POS-source + sale (not refund) + SHIPPED;
+      missing / out-of-scope / wrong-source / wrong-state all
+      conflate to 404 original_so_not_found to prevent enumeration.
+    """
+    cap_bytes = get_max_body_kb() * 1024
+    if request.content_length is not None and request.content_length > cap_bytes:
+        return _err(
+            "body_too_large",
+            "request body exceeds SENTRY_POS_MAX_BODY_KB",
+            413,
+            {"max_body_kb": get_max_body_kb()},
+        )
+
+    try:
+        body = RefundBody.model_validate(request.get_json(silent=False))
+    except ValidationError as exc:
+        return _pydantic_invalid_body(exc)
+    except Exception:
+        return _err("invalid_body", "body is not valid JSON", 422)
+
+    body_dict = body.model_dump(mode="json")
+    body_hash = canonical_body_sha256(body_dict)
+    idempotency_key_str = body_dict["idempotency_key"]
+
+    token_warehouse_ids = list(g.current_token.get("warehouse_ids") or [])
+
+    # Warm-cache replay short-circuit on the REFUND idempotency_key.
+    # The credit-memo SO row carries the key; the original sale's row
+    # carries its own (different) key.
+    cached = g.db.execute(
+        text(
+            """
+            SELECT so_id, so_number, idempotency_body_hash, cached_response_body
+              FROM sales_orders
+             WHERE idempotency_key = :key
+             LIMIT 1
+            """
+        ),
+        {"key": idempotency_key_str},
+    ).fetchone()
+    if cached is not None:
+        if cached.idempotency_body_hash != body_hash:
+            return _err(
+                "idempotency_key_reused_with_different_body",
+                "idempotency_key matches an existing refund but body differs",
+                409,
+                {"existing_refund_so_id": cached.so_number},
+            )
+        if cached.cached_response_body is not None:
+            g._pos_replay_hit = True
+            return _replay_response(cached.cached_response_body)
+        # cached_response_body NULL: in-flight peer; fall through.
+
+    _set_lock_timeouts(g.db)
+
+    # Lock the original SO. Conflate every "you can't refund this"
+    # cause to 404 original_so_not_found (missing, out-of-scope,
+    # wrong source, wrong state) so the token cannot enumerate
+    # sister-warehouse SOs or distinguish a non-POS SO from a missing
+    # one. The 422 conditions (90-day window, tender mismatch,
+    # already refunded) are intentional informational responses
+    # because the token already knows the SO exists -- they are
+    # operator-actionable errors, not enumeration vectors.
+    if not token_warehouse_ids:
+        return _err("original_so_not_found", "no POS SO found with the given id", 404)
+
+    try:
+        original = g.db.execute(
+            text(
+                """
+                SELECT so_id, so_number, status, warehouse_id, created_at,
+                       order_source, order_type,
+                       refunded_at, refund_so_id
+                  FROM sales_orders
+                 WHERE so_number      = :osn
+                   AND order_source   = 'pos'
+                   AND order_type     = 'sale'
+                   AND warehouse_id   = ANY(:wh_ids)
+                 FOR UPDATE
+                """
+            ),
+            {
+                "osn":     body.original_so_id,
+                "wh_ids":  token_warehouse_ids,
+            },
+        ).fetchone()
+    except OperationalError as exc:
+        if isinstance(exc.orig, (LockNotAvailable, QueryCanceled)):
+            g.db.rollback()
+            return _lock_contention()
+        raise
+
+    if original is None:
+        g.db.rollback()
+        return _err("original_so_not_found", "no POS SO found with the given id", 404)
+
+    if original.status != "SHIPPED":
+        # Wrong state. Conflate to 404 so a token cannot probe SO
+        # state by issuing successive refund attempts.
+        g.db.rollback()
+        return _err("original_so_not_found", "no POS SO found with the given id", 404)
+
+    if original.refunded_at is not None or original.refund_so_id is not None:
+        existing_refund_so_number = None
+        if original.refund_so_id is not None:
+            row = g.db.execute(
+                text("SELECT so_number FROM sales_orders WHERE so_id = :id"),
+                {"id": original.refund_so_id},
+            ).fetchone()
+            if row is not None:
+                existing_refund_so_number = row.so_number
+        g.db.rollback()
+        return _err(
+            "already_refunded",
+            "original SO has already been refunded",
+            422,
+            {"existing_refund_so_id": existing_refund_so_number},
+        )
+
+    # 90-day window. Comparing the original sale's created_at against
+    # NOW(). Postgres handles the interval math.
+    window_check = g.db.execute(
+        text(
+            "SELECT (:created_at >= NOW() - INTERVAL '90 days') AS within_window"
+        ),
+        {"created_at": original.created_at},
+    ).fetchone()
+    if not window_check.within_window:
+        g.db.rollback()
+        return _err(
+            "refund_window_expired",
+            f"original sale is older than {_REFUND_WINDOW_DAYS} days",
+            422,
+            {"original_created_at": original.created_at.isoformat()},
+        )
+
+    # Tender mismatch + line-location lookup both come from the
+    # POS_CHECKOUT audit_log row for the original SO. The audit_log
+    # is the canonical archival venue for POS sale details (no
+    # per-line price columns on sales_order_lines in v1.10).
+    audit_row = g.db.execute(
+        text(
+            """
+            SELECT details
+              FROM audit_log
+             WHERE entity_type = 'SO'
+               AND entity_id   = :so_id
+               AND action_type = :action
+             ORDER BY log_id ASC
+             LIMIT 1
+            """
+        ),
+        {"so_id": original.so_id, "action": ACTION_POS_CHECKOUT},
+    ).fetchone()
+    if audit_row is None:
+        # Data-integrity surprise: every POS checkout writes one
+        # POS_CHECKOUT audit row in the same transaction as the SO
+        # insert. A missing audit row means audit_log was tampered
+        # with or the original SO was created via a different path
+        # that bypassed checkout(). Fail closed; no refund without
+        # the canonical line-location data.
+        g.db.rollback()
+        return _err(
+            "original_so_not_found",
+            "audit details missing for original SO",
+            404,
+        )
+
+    audit_details = audit_row.details or {}
+    original_payment_method = audit_details.get("payment_method")
+    refund_method = body.refund_summary.method
+    if original_payment_method != refund_method:
+        g.db.rollback()
+        return _err(
+            "tender_mismatch",
+            f"{original_payment_method} sale cannot be refunded as {refund_method}",
+            422,
+            {
+                "original_method": original_payment_method,
+                "refund_method":   refund_method,
+            },
+        )
+
+    original_lines_locations = audit_details.get("lines") or []
+    if not original_lines_locations:
+        g.db.rollback()
+        return _err(
+            "original_so_not_found",
+            "audit details carry no line locations",
+            404,
+        )
+
+    # Resolve original-line (sku, warehouse_code, bin_code) to internal
+    # IDs. Any unresolved row is a data-integrity surprise.
+    resolved = _bulk_resolve_locations(g.db, original_lines_locations)
+    for r in resolved:
+        if r.item_id is None or r.warehouse_id is None or r.bin_id is None:
+            g.db.rollback()
+            return _err(
+                "original_so_not_found",
+                "could not resolve original line locations",
+                404,
+            )
+
+    # Pre-fetch credit-memo so_id; build refund_so_number.
+    refund_so_id = g.db.execute(
+        text("SELECT nextval('sales_orders_so_id_seq')")
+    ).scalar()
+    refund_so_number = f"SO-POS-REF-{refund_so_id}"
+
+    # INSERT the credit-memo SO. ON CONFLICT (idempotency_key) DO
+    # NOTHING handles the concurrent-retry case; a peer that
+    # committed during the warm-cache step gets re-read for replay.
+    try:
+        inserted = g.db.execute(
+            text(
+                """
+                INSERT INTO sales_orders (
+                    so_id, so_number, so_barcode, status, warehouse_id,
+                    created_by, created_at, shipped_at, external_id,
+                    order_source, order_type, parent_so_id,
+                    external_txn_ref, idempotency_key, idempotency_body_hash
+                ) VALUES (
+                    :so_id, :so_number, :so_number, 'SHIPPED', :wh_id,
+                    'pos', NOW(), :shipped_at, :ext_id,
+                    'pos', 'refund', :parent_so_id,
+                    :external_txn_ref, :idempotency_key, :body_hash
+                )
+                ON CONFLICT (idempotency_key) DO NOTHING
+                RETURNING so_id
+                """
+            ),
+            {
+                "so_id":            refund_so_id,
+                "so_number":        refund_so_number,
+                "wh_id":            original.warehouse_id,
+                "shipped_at":       body.completed_at,
+                "ext_id":           str(_uuid.uuid4()),
+                "parent_so_id":     original.so_id,
+                "external_txn_ref": body.external_refund_ref,
+                "idempotency_key":  idempotency_key_str,
+                "body_hash":        body_hash,
+            },
+        ).fetchone()
+    except OperationalError as exc:
+        if isinstance(exc.orig, (LockNotAvailable, QueryCanceled)):
+            g.db.rollback()
+            return _lock_contention()
+        raise
+
+    if inserted is None:
+        # Peer committed a refund under the same key while we were
+        # preparing this transaction. Re-read for the cached body.
+        peer = g.db.execute(
+            text(
+                """
+                SELECT so_number, idempotency_body_hash, cached_response_body
+                  FROM sales_orders
+                 WHERE idempotency_key = :key
+                """
+            ),
+            {"key": idempotency_key_str},
+        ).fetchone()
+        g.db.rollback()
+        if peer is None:
+            return _lock_contention()
+        if peer.idempotency_body_hash != body_hash:
+            return _err(
+                "idempotency_key_reused_with_different_body",
+                "idempotency_key matches an existing refund but body differs",
+                409,
+                {"existing_refund_so_id": peer.so_number},
+            )
+        if peer.cached_response_body is None:
+            return _lock_contention()
+        g._pos_replay_hit = True
+        return _replay_response(peer.cached_response_body)
+
+    # Per-line: SELECT FOR UPDATE inventory, INSERT credit-memo
+    # sales_order_lines with NEGATIVE quantities, UPDATE inventory
+    # SET on_hand = on_hand + original_qty (re-increment).
+    # Deterministic ordering by (item_id, bin_id) prevents deadlock
+    # between concurrent refunds touching overlapping inventory.
+    sorted_resolved = sorted(resolved, key=lambda r: (r.item_id, r.bin_id))
+    try:
+        for r in sorted_resolved:
+            qty = int(r.qty)
+            inv = g.db.execute(
+                text(
+                    """
+                    SELECT inventory_id, quantity_on_hand
+                      FROM inventory
+                     WHERE item_id      = :item_id
+                       AND warehouse_id = :wh_id
+                       AND bin_id       = :bin_id
+                     ORDER BY inventory_id
+                     LIMIT 1
+                     FOR UPDATE
+                    """
+                ),
+                {
+                    "item_id": r.item_id,
+                    "wh_id":   r.warehouse_id,
+                    "bin_id":  r.bin_id,
+                },
+            ).fetchone()
+            if inv is None:
+                # The original sale created this inventory row.
+                # Missing means operator-run SQL (or a deletion bug)
+                # has wiped it; refusing to silently fail.
+                g.db.rollback()
+                return _err(
+                    "original_so_not_found",
+                    "could not relocate original inventory row",
+                    404,
+                )
+            g.db.execute(
+                text(
+                    """
+                    INSERT INTO sales_order_lines (
+                        so_id, item_id, quantity_ordered, quantity_allocated,
+                        quantity_picked, quantity_packed, quantity_shipped,
+                        line_number, status
+                    ) VALUES (
+                        :so_id, :item_id, :neg_qty, 0,
+                        :neg_qty, :neg_qty, :neg_qty,
+                        :line_number, 'SHIPPED'
+                    )
+                    """
+                ),
+                {
+                    "so_id":       refund_so_id,
+                    "item_id":     r.item_id,
+                    "neg_qty":     -qty,
+                    "line_number": r.idx + 1,
+                },
+            )
+            g.db.execute(
+                text(
+                    """
+                    UPDATE inventory
+                       SET quantity_on_hand = quantity_on_hand + :qty,
+                           updated_at       = NOW()
+                     WHERE inventory_id = :inventory_id
+                    """
+                ),
+                {"qty": qty, "inventory_id": inv.inventory_id},
+            )
+    except OperationalError as exc:
+        if isinstance(exc.orig, (LockNotAvailable, QueryCanceled)):
+            g.db.rollback()
+            return _lock_contention()
+        raise
+
+    # Mark the original SO as refunded.
+    g.db.execute(
+        text(
+            """
+            UPDATE sales_orders
+               SET refunded_at  = NOW(),
+                   refund_so_id = :refund_so_id
+             WHERE so_id = :original_so_id
+            """
+        ),
+        {
+            "refund_so_id":   refund_so_id,
+            "original_so_id": original.so_id,
+        },
+    )
+
+    # Audit log on the credit-memo SO. Mirrors POS_CHECKOUT details
+    # shape so the refund row reads cleanly alongside the sale row
+    # in any forensic timeline query.
+    write_audit_log(
+        g.db,
+        action_type=ACTION_POS_REFUND,
+        entity_type="SO",
+        entity_id=refund_so_id,
+        user_id=body.cashier_id,
+        warehouse_id=original.warehouse_id,
+        details={
+            "idempotency_key":           idempotency_key_str,
+            "external_refund_ref":       body.external_refund_ref,
+            "original_external_txn_ref": body.original_external_txn_ref,
+            "original_so_id":            body.original_so_id,
+            "refund_so_number":          refund_so_number,
+            "terminal_id":               body.terminal_id,
+            "total_cents":               body.refund_summary.total_cents,
+            "payment_method":            refund_method,
+            "lines":                     original_lines_locations,
+        },
+    )
+
+    response_body_dict = {
+        "refund_so_id":   refund_so_number,
+        "original_so_id": original.so_number,
+        "replayed":       False,
+    }
+    g.db.execute(
+        text(
+            """
+            UPDATE sales_orders
+               SET cached_response_body = CAST(:body AS jsonb)
+             WHERE so_id = :so_id
+            """
+        ),
+        {
+            "so_id": refund_so_id,
             "body":  json.dumps(response_body_dict),
         },
     )

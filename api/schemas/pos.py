@@ -187,3 +187,38 @@ class CheckoutBody(BaseModel):
     completed_at:      datetime
     payment_summary:   PaymentSummary
     lines:             List[CheckoutLine] = Field(..., min_length=_LINES_MIN, max_length=_LINES_MAX)
+
+
+# ----------------------------------------------------------------------
+# Refund body
+# ----------------------------------------------------------------------
+
+# Original SO numbers issued by the POS surface follow "SO-POS-{integer}"
+# (see routes/pos.py checkout). Refusing other shapes at the schema
+# boundary prevents a non-POS so_number from ever reaching the DB
+# query and getting conflated with 404 original_so_not_found.
+_ORIGINAL_SO_RE = r"^SO-POS-\d+$"
+
+
+class RefundBody(BaseModel):
+    """POST /api/v1/pos/refund body.
+
+    Full-order refund only in v1. The request body does NOT include
+    line specifications: Sentry derives the line set from the
+    original SO via the POS_CHECKOUT audit_log entry. external_refund_
+    ref is the Windcave (or cash) reference for the refund leg
+    itself; original_external_txn_ref is the original sale's
+    DpsTxnRef, included for cross-check (Sentry does not require it
+    to match but it is captured in the refund's audit_log details).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    idempotency_key:           UUID4
+    original_so_id:            str             = Field(..., pattern=_ORIGINAL_SO_RE, max_length=_SKU_MAX + 16)
+    original_external_txn_ref: str             = Field(..., min_length=1, max_length=_EXTERNAL_TXN_REF_MAX)
+    external_refund_ref:       str             = Field(..., min_length=1, max_length=_EXTERNAL_TXN_REF_MAX)
+    cashier_id:                str             = Field(..., min_length=1, max_length=_CASHIER_ID_MAX)
+    terminal_id:               str             = Field(..., min_length=1, max_length=_TERMINAL_ID_MAX)
+    completed_at:              datetime
+    refund_summary:            PaymentSummary
