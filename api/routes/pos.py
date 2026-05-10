@@ -266,9 +266,9 @@ def availability():
         "name":         item.item_name,
         "barcode":      item.upc,
         # is_taxable is hardcoded true. items has no is_taxable column
-        # in v1.10; a follow-up adds the column when AvidMax has tax-
-        # exempt SKUs. The POS Service treats every item as taxable
-        # under the universal tax rate from its .env.
+        # in v1.10; a follow-up adds the column when a deployment
+        # needs tax-exempt SKUs. The POS Service treats every item as
+        # taxable under the universal tax rate from its .env.
         "is_taxable":   True,
         "availability": availability_by_warehouse,
     }
