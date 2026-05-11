@@ -2,6 +2,20 @@
 
 All notable changes to Sentry WMS will be documented in this file.
 
+## [v1.10.1] - 2026-05-11
+
+Patch release. Two operator-experience changes on top of the v1.10.0 POS surface: the admin token validator now accepts the dockd and POS slugs it would not before, and the admin Imports page gains a fifth tab for bulk inventory-adjustment CSV uploads.
+
+**Mobile.** Zero mobile/ diffs on this branch. v1.9.0 APK (versionCode 6) remains the working baseline; no new APK build for v1.10.1. Operators running the v1.9.0 mobile app continue to work against a v1.10.1 backend with no upgrade.
+
+### Added
+
+- **Inventory adjustment CSV import** (#329): new `inventory-adjustments` arm on `POST /api/admin/import/<type>` alongside items / bins / purchase-orders / sales-orders. Required columns: `sku`, `warehouse`, `bin`, `qty` (signed integer), `memo` (optional, <=500 chars). Each accepted row resolves `sku` against `items.sku`, `warehouse` against `warehouses.warehouse_code`, `bin` against `bins.bin_code` (must belong to the resolved warehouse), and writes an `inventory_adjustments` row with `reason_code='CORRECTION'`, `status='APPROVED'`, `reason_detail=memo` so the on-hand change applies inline. Positive qty goes through `services.inventory_service.add_inventory` (advisory-locked, creates the inventory row when absent); negative qty takes `FOR UPDATE` on the inventory row and rejects with a row-level error when available on-hand is insufficient. One `audit_log` row (`ACTION_ADJUST`) and one `adjustment.applied/1` outbox event fire per row so subscribers see one event per imported correction. Existing 5000-record cap and V-015 formula-prefix sanitiser apply unchanged. Admin Imports page gains an "Inventory Adjustments" tab with template download (5 columns, 3 example rows). New alignment test pins the template header to the server schema field list so a future schema change fails the test instead of an operator's import.
+
+### Fixed
+
+- **`admin/tokens` validator accepts `dockd.dispatch` and `pos.dispatch`**: `CreateTokenRequest` and `UpdateTokenRequest` only recognized V150 outbound slugs in `_known_slugs_only`, so `POST /api/admin/tokens` with `endpoints=['pos.dispatch']` or `['dockd.dispatch']` returned 400 `unknown_endpoint_slugs` even though the auth middleware honors both slugs at request time and scope-catalog advertises them. Operators could not issue dockd or POS tokens through the admin API. New `_KNOWN_ENDPOINT_SLUGS = V150 keys + V190_DOCKD_SLUG + V1100_POS_SLUG` is the single source the validator's accept set and "unknown slug" error message both read from.
+
 ## [v1.10.0] - 2026-05-09
 
 "POS endpoint surface" release. Sentry now serves a dedicated counter-sale API for an external POS Service: four endpoints under `/api/v1/pos/` (`GET /availability`, `POST /validate-cart`, `POST /checkout`, `POST /refund`) authenticated by a new fourth direction `pos.dispatch` alongside outbound polling, inbound POST, and dockd. Checkout and refund are atomic single-transaction routes with row-level `SELECT ... FOR UPDATE` on the inventory rows being decremented or re-incremented, idempotent on a per-route `idempotency_key` (UUID4) with a SHA-256 body hash so a retry with the same key + same body replays the cached response and a retry with the same key + different body returns 409. Refund enforces a 90-day window, a card-vs-cash tender lock, and a once-per-original-SO guard via `refunded_at` / `refund_so_id` on the original sales_orders row. Pricing stays out of Sentry: per-line `unit_price_cents` / `tax_cents` / `line_total_cents` ride on the wire and land in `audit_log.details` for archival, while the POS Service owns its own pricing source.

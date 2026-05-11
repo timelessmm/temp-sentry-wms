@@ -744,6 +744,142 @@ class TestCsvImport:
         assert resp.status_code == 400
         assert "5000" in resp.get_json()["error"]
 
+    def test_import_inventory_adjustments_positive_and_negative(self, client, auth_headers):
+        """v1.10.1 #329: bulk inventory adjustments via CSV import.
+
+        Seed has TST-001 with 50 on-hand in bin A-01-01 (warehouse APT-LAB).
+        Apply +5 then -3 to that bin; verify final on-hand = 52,
+        two APPROVED inventory_adjustments rows, and two
+        adjustment.applied events on the integration_events outbox.
+        """
+        before = _query_val(
+            "SELECT inv.quantity_on_hand FROM inventory inv "
+            "JOIN items i ON i.item_id = inv.item_id "
+            "JOIN bins b ON b.bin_id = inv.bin_id "
+            "WHERE i.sku = 'TST-001' AND b.bin_code = 'A-01-01'"
+        )
+        assert before == 50
+
+        resp = client.post(
+            "/api/admin/import/inventory-adjustments",
+            json={
+                "records": [
+                    {"sku": "TST-001", "warehouse": "APT-LAB", "bin": "A-01-01", "qty": 5, "memo": "Found extras"},
+                    {"sku": "TST-001", "warehouse": "APT-LAB", "bin": "A-01-01", "qty": -3, "memo": "Damaged"},
+                ]
+            },
+            headers=auth_headers,
+        )
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["imported"] == 2
+        assert data["skipped"] == 0
+
+        after = _query_val(
+            "SELECT inv.quantity_on_hand FROM inventory inv "
+            "JOIN items i ON i.item_id = inv.item_id "
+            "JOIN bins b ON b.bin_id = inv.bin_id "
+            "WHERE i.sku = 'TST-001' AND b.bin_code = 'A-01-01'"
+        )
+        assert after == 52
+
+        conn = get_raw_connection()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT reason_code, status, quantity_change "
+            "FROM inventory_adjustments ia "
+            "JOIN items i ON i.item_id = ia.item_id "
+            "WHERE i.sku = 'TST-001' "
+            "ORDER BY adjustment_id DESC LIMIT 2"
+        )
+        rows = cur.fetchall()
+        cur.close()
+        assert len(rows) == 2
+        for reason_code, status, _qc in rows:
+            assert reason_code == "CORRECTION"
+            assert status == "APPROVED"
+
+        conn = get_raw_connection()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT (payload->>'quantity_delta')::int AS delta "
+            "FROM integration_events "
+            "WHERE event_type = 'adjustment.applied' "
+            "ORDER BY event_id DESC LIMIT 2"
+        )
+        deltas = sorted(r[0] for r in cur.fetchall())
+        cur.close()
+        assert deltas == [-3, 5]
+
+    def test_import_inventory_adjustments_unknown_sku_skips_row(self, client, auth_headers):
+        resp = client.post(
+            "/api/admin/import/inventory-adjustments",
+            json={
+                "records": [
+                    {"sku": "NO-SUCH-SKU", "warehouse": "APT-LAB", "bin": "A-01-01", "qty": 1, "memo": ""},
+                ]
+            },
+            headers=auth_headers,
+        )
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["imported"] == 0
+        assert data["skipped"] == 1
+        assert "Item not found" in data["errors"][0]["error"]
+
+    def test_import_inventory_adjustments_bin_must_belong_to_warehouse(self, client, auth_headers):
+        """A bin code that exists but lives in a different warehouse is
+        rejected with a row-level error, not silently applied to the
+        wrong warehouse."""
+        resp = client.post(
+            "/api/admin/import/inventory-adjustments",
+            json={
+                "records": [
+                    {"sku": "TST-001", "warehouse": "VIRTUAL", "bin": "A-01-01", "qty": 1, "memo": ""},
+                ]
+            },
+            headers=auth_headers,
+        )
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["imported"] == 0
+        assert data["skipped"] == 1
+        assert "not found in warehouse" in data["errors"][0]["error"]
+
+    def test_import_inventory_adjustments_insufficient_stock_skips_row(self, client, auth_headers):
+        """A negative qty exceeding available on-hand is rejected with
+        a row-level error; the inventory row is not mutated."""
+        resp = client.post(
+            "/api/admin/import/inventory-adjustments",
+            json={
+                "records": [
+                    {"sku": "TST-001", "warehouse": "APT-LAB", "bin": "A-01-01", "qty": -100000, "memo": ""},
+                ]
+            },
+            headers=auth_headers,
+        )
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["imported"] == 0
+        assert data["skipped"] == 1
+        assert "Insufficient inventory" in data["errors"][0]["error"]
+
+    def test_import_inventory_adjustments_zero_qty_rejected(self, client, auth_headers):
+        resp = client.post(
+            "/api/admin/import/inventory-adjustments",
+            json={
+                "records": [
+                    {"sku": "TST-001", "warehouse": "APT-LAB", "bin": "A-01-01", "qty": 0, "memo": ""},
+                ]
+            },
+            headers=auth_headers,
+        )
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["imported"] == 0
+        assert data["skipped"] == 1
+        assert "qty" in data["errors"][0]["error"]
+
 
 # ── Dashboard Stats ───────────────────────────────────────────────────────────
 
